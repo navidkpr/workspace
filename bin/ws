@@ -3835,7 +3835,7 @@ const launchCursorReview = (workspace) => {
   if (!cursor) {
     fail("Cursor's command-line tool is not installed")
   }
-  const child = spawn(cursor, ["--classic", "--new-window", workspace], {
+  const child = spawn(cursor, [workspace, "--classic"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore",
