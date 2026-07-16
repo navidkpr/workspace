@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+
+export HOME="$test_root/home"
+export XDG_CONFIG_HOME="$HOME/.config"
+export WS_SKIP_GHOSTTY=1
+export WS_SKIP_TMUX_RELOAD=1
+mkdir -p "$HOME"
+
+"$repository_dir/install.sh"
+"$repository_dir/install.sh"
+
+test -x "$HOME/.local/bin/ws"
+test -f "$HOME/.zsh/completions/_ws"
+test -f "$HOME/.config/ws/config.json"
+test -f "$HOME/.config/ws/tmux.conf"
+test -f "$HOME/.config/ws/ghostty.conf"
+test "$(grep -Fc '# workspace completion' "$HOME/.zshrc")" -eq 1
+! grep -Fq '@WS_BIN@' "$HOME/.config/ws/tmux.conf"
+grep -Fq "$HOME/.local/bin/ws" "$HOME/.config/ws/tmux.conf"
+"$HOME/.local/bin/ws" help >/dev/null
+
+printf 'install test passed\n'

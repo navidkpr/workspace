@@ -1,0 +1,100 @@
+#compdef ws
+
+_ws_managed_workspace() {
+  local line
+  local -a workspaces
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && workspaces+=("$line")
+  done < <(command ws list --names-only 2>/dev/null)
+
+  _describe "workspace" workspaces
+}
+
+_ws_workspace() {
+  local line
+  local -a workspaces
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && workspaces+=("$line")
+  done < <(command ws list --names-only 2>/dev/null)
+
+  workspaces+=(".:current checkout")
+  _describe "workspace" workspaces
+}
+
+_ws() {
+  local -a commands
+  commands=(
+    "new:create a workspace"
+    "ne:create a workspace"
+    "open:open a workspace"
+    "op:open a workspace"
+    "repair:reconcile sessions while preserving compatible pane positions"
+    "remove:archive sessions and remove a workspace"
+    "rm:archive sessions and remove a workspace"
+    "cp:copy a session into the current workspace"
+    "mv:move a session into the current workspace"
+    "sessions:list workspace sessions"
+    "list:list workspaces"
+    "ls:list workspaces"
+    "path:print a workspace path"
+    "config:edit ws settings"
+    "cfg:edit ws settings"
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe "command" commands
+    return
+  fi
+
+  case "$words[2]" in
+    new|ne)
+      _arguments \
+        "2:workspace name:" \
+        "--base=[base Git ref]:Git ref:__git_revisions" \
+        "--no-open[create without launching Codex]" \
+        "--window[open in one new Ghostty window]" \
+        "--tabs[add tabs to the current Ghostty window]" \
+        "--dry-run[print actions without executing them]"
+      ;;
+    open|op)
+      _arguments \
+        "2:workspace:_ws_workspace" \
+        "--fresh[start a fresh Codex session]" \
+        "--window[open in one new Ghostty window]" \
+        "--tabs[add tabs to the current Ghostty window]" \
+        "--dry-run[print actions without executing them]"
+      ;;
+    repair)
+      _arguments \
+        "--all[repair every workspace tab in the current Ghostty window]" \
+        "--window[rebuild sessions in one new Ghostty window]" \
+        "--tabs[rebuild sessions as tabs in the current Ghostty window]" \
+        "--dry-run[print the relayout without executing it]"
+      ;;
+    remove|rm|delete)
+      _arguments \
+        "2:workspace:_ws_managed_workspace" \
+        "--force[discard uncommitted changes and ignore open sessions]" \
+        "--keep-branch[remove the worktree but keep its branch]" \
+        "--dry-run[print actions without executing them]"
+      ;;
+    cp|mv)
+      _arguments \
+        "2:object:(session)" \
+        "3:session id:"
+      ;;
+    sessions|path)
+      _arguments "2:workspace:_ws_workspace"
+      ;;
+    list|ls)
+      _arguments "--names-only[print only workspace names]"
+      ;;
+    config|cfg)
+      _arguments
+      ;;
+  esac
+}
+
+_ws "$@"

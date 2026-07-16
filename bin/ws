@@ -1,0 +1,3428 @@
+#!/usr/bin/env node
+
+import { spawn, spawnSync } from "node:child_process"
+import { createHash, randomUUID } from "node:crypto"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
+import path from "node:path"
+import readline from "node:readline"
+
+const commandName = path.basename(process.argv[1])
+const workspaceRoot = path.resolve(
+  process.env.CODEX_WS_ROOT ?? path.join(homedir(), "Worktrees", "codex"),
+)
+const configDirectory = path.resolve(
+  process.env.XDG_CONFIG_HOME?.trim() || path.join(homedir(), ".config"),
+  "ws",
+)
+const configPath = path.join(configDirectory, "config.json")
+const tmuxConfigPath = path.join(configDirectory, "tmux.conf")
+const titleDaemonPidPath = path.join(configDirectory, "title-daemon.pid")
+const tmuxSocketName = "codex-ws"
+const defaultConfig = { openMode: "window", paneLayout: "1x2", sessionBackend: "direct" }
+const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
+const archiveEditorMarker = "__WS_ARCHIVE_CURRENT_SESSION__"
+const newSessionEditorMarker = "__WS_NEW_SESSION__"
+const defaultForkMessage = "I forked the previous chat into this one. The original is continuing independently. Continue here with a separate task:\n"
+
+const fail = (message) => {
+  process.stderr.write(`${commandName}: ${message}\n`)
+  process.exit(1)
+}
+
+const run = (command, args, options = {}) => {
+  const result = spawnSync(command, args, {
+    cwd: options.cwd,
+    encoding: "utf8",
+    stdio: options.inherit ? "inherit" : "pipe",
+  })
+
+  if (result.error) {
+    fail(`${command} failed: ${result.error.message}`)
+  }
+
+  if (result.status !== 0 && !options.allowFailure) {
+    const detail = result.stderr?.trim()
+    fail(detail || `${command} exited with status ${result.status}`)
+  }
+
+  return result
+}
+
+const commandPath = (command) => {
+  const result = run("/usr/bin/which", [command], { allowFailure: true })
+  return result.status === 0 ? result.stdout.trim() : null
+}
+
+const canonicalPath = (value) => {
+  const resolved = path.resolve(value)
+  return existsSync(resolved) ? realpathSync(resolved) : resolved
+}
+
+const shellQuote = (value) => `'${value.replaceAll("'", `'\\''`)}'`
+
+const readConfig = () => {
+  if (!existsSync(configPath)) {
+    return defaultConfig
+  }
+
+  const openModeResult = run("/usr/bin/plutil", [
+    "-extract",
+    "openMode",
+    "raw",
+    "-o",
+    "-",
+    configPath,
+  ], { allowFailure: true })
+  if (openModeResult.status !== 0) {
+    const detail = openModeResult.stderr.trim()
+    fail(`invalid config at ${configPath}${detail ? `: ${detail}` : ""}`)
+  }
+
+  const openMode = (() => {
+    switch (openModeResult.stdout.trim()) {
+      case "window":
+      case "windows":
+        return "window"
+      case "tab":
+      case "tabs":
+        return "tabs"
+      default:
+        fail(`invalid openMode ${JSON.stringify(openModeResult.stdout.trim())} in ${configPath}; expected "window" or "tabs"`)
+    }
+  })()
+
+  const paneLayoutResult = run("/usr/bin/plutil", [
+    "-extract",
+    "paneLayout",
+    "raw",
+    "-o",
+    "-",
+    configPath,
+  ], { allowFailure: true })
+  const paneLayout = paneLayoutResult.status === 0
+    ? paneLayoutResult.stdout.trim()
+    : defaultConfig.paneLayout
+  switch (paneLayout) {
+    case "1x1":
+    case "1x2":
+    case "2x1":
+    case "2x2":
+      break
+    default:
+      fail(`invalid paneLayout ${JSON.stringify(paneLayout)} in ${configPath}; expected "1x1", "1x2", "2x1", or "2x2"`)
+  }
+
+  const sessionBackendResult = run("/usr/bin/plutil", [
+    "-extract",
+    "sessionBackend",
+    "raw",
+    "-o",
+    "-",
+    configPath,
+  ], { allowFailure: true })
+  const sessionBackend = sessionBackendResult.status === 0
+    ? sessionBackendResult.stdout.trim()
+    : defaultConfig.sessionBackend
+  switch (sessionBackend) {
+    case "direct":
+    case "tmux":
+      return { openMode, paneLayout, sessionBackend }
+    default:
+      fail(`invalid sessionBackend ${JSON.stringify(sessionBackend)} in ${configPath}; expected "direct" or "tmux"`)
+  }
+}
+
+const editConfig = () => {
+  mkdirSync(configDirectory, { recursive: true })
+  if (!existsSync(configPath)) {
+    writeFileSync(configPath, `${JSON.stringify(defaultConfig, null, 2)}\n`)
+  }
+
+  const editor = process.env.VISUAL?.trim() || process.env.EDITOR?.trim() || "vim"
+  const result = spawnSync("/bin/zsh", [
+    "-lc",
+    `exec ${editor} ${shellQuote(configPath)}`,
+  ], { stdio: "inherit" })
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message ?? `${editor} exited with status ${result.status}`
+    fail(`could not edit ${configPath}: ${detail}`)
+  }
+
+  const config = readConfig()
+  process.stdout.write(`Saved ${configPath} (openMode: ${config.openMode}, paneLayout: ${config.paneLayout}, sessionBackend: ${config.sessionBackend}).\n`)
+}
+
+const resolveLaunchSettings = (options) => {
+  if (options.window && options.tabs) {
+    fail("--window and --tabs cannot be used together")
+  }
+
+  const config = readConfig()
+  const openMode = options.window
+    ? "window"
+    : options.tabs
+      ? "tabs"
+      : config.openMode
+  return {
+    open_mode: openMode,
+    pane_layout: config.paneLayout,
+    session_backend: config.sessionBackend,
+  }
+}
+
+const appleScriptQuote = (value) => `"${value
+  .replaceAll("\\", "\\\\")
+  .replaceAll('"', '\\"')
+  .replaceAll("\n", "\\n")}"`
+
+const resolveEditorIntent = (repo, editorPath) => {
+  const editorContents = readFileSync(editorPath, "utf8")
+  if (editorContents.includes(archiveEditorMarker)) {
+    return "archive"
+  }
+  if (editorContents.includes(newSessionEditorMarker)) {
+    return "new"
+  }
+
+  const sourceTty = currentGhosttyTty()
+  if (!sourceTty) {
+    return "fork"
+  }
+
+  const workspaceName = path.basename(repo.topLevel)
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if tty of candidateTerminal is ${appleScriptQuote(sourceTty)} then`,
+    "set editorIntent to \"fork\"",
+    `if name of candidateTab is ${appleScriptQuote(archiveEditorMarker)} then`,
+    "set editorIntent to \"archive\"",
+    `else if name of candidateTab is ${appleScriptQuote(newSessionEditorMarker)} then`,
+    "set editorIntent to \"new\"",
+    "end if",
+    "if editorIntent is \"fork\" then return editorIntent",
+    "set existingTerminal to focused terminal of candidateTab",
+    `perform action ${appleScriptQuote(`set_tab_title:${workspaceName}`)} on existingTerminal`,
+    "return editorIntent",
+    "end if",
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    "return \"fork\"",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not inspect the current Ghostty tab")
+  }
+  switch (result.stdout.trim()) {
+    case "archive":
+      return "archive"
+    case "fork":
+      return "fork"
+    case "new":
+      return "new"
+    default:
+      fail("Ghostty returned an invalid editor action")
+  }
+}
+
+const ghosttyTextAction = (value) => `text:\\x1b[200~${value
+  .replaceAll("\\", "\\\\")
+  .replaceAll("\r", "\\x0d")
+  .replaceAll("\n", "\\x0a")}\\x1b[201~`
+
+const usage = () => {
+  process.stdout.write(`Usage:
+  ${commandName}                          Open the interactive workspace picker.
+  ${commandName} new|ne <name> [--base <ref>] [--no-open] [--window|--tabs] [--dry-run]
+  ${commandName} open|op <name|.> [--fresh] [--window|--tabs] [--dry-run]
+  ${commandName} repair [--all] [--window|--tabs] [--dry-run]
+  ${commandName} remove|rm <name> [--force] [--keep-branch] [--dry-run]
+  ${commandName} cp session <session-id>
+  ${commandName} mv session <session-id>
+  ${commandName} sessions <name|.>
+  ${commandName} list|ls [--names-only]
+  ${commandName} path <name|.>
+  ${commandName} config|cfg
+
+Commands:
+  ${commandName}          Search, inspect, and open a workspace interactively.
+  new, ne      Create codex/<name> in an isolated Git worktree and launch Codex.
+  open, op     Resume every non-archived, inactive Codex session in the worktree.
+               Packs sessions into the configured pane layout. Starts a fresh
+               session when none exist. Use --fresh to ignore history.
+  repair       Rebuild every Codex session for the current checkout.
+               Preserves compatible pane positions and every unrelated pane.
+               Restarts only misplaced Codex panes and fills empty layout slots.
+               The open mode is used only when no Codex pane is currently open.
+               Use --all to repair every workspace tab in the current window.
+  remove, rm   Archive its Codex sessions, then delete the worktree and branch.
+  cp session   Copy a Codex session into the current checkout with a new ID.
+  mv session   Move a Codex session into the current checkout and archive the source.
+  sessions     List the sessions associated with a worktree.
+  list, ls     List worktrees with activity, Git state, and latest session.
+  path         Print a worktree's path. A name of "." means the current checkout.
+  config, cfg  Edit ${configPath} with $VISUAL, $EDITOR, or vim.
+
+Open modes:
+  window       Open one dedicated Ghostty window (default).
+  tabs         Add named tabs to the current/front Ghostty window.
+  Override the configured mode per call with --window or --tabs.
+
+Pane layouts (set paneLayout in config):
+  1x1          One session per tab.
+  1x2          Two side-by-side sessions per tab (default).
+  2x1          Two stacked sessions per tab.
+  2x2          Pack forks as 1, 1|1, 2|1, 2|2, then start the next tab.
+
+Session backends (set sessionBackend in config):
+  direct       Run Codex directly in its Ghostty pane.
+  tmux         Keep Codex running when its Ghostty pane or tab closes.
+
+Ghostty shortcuts:
+  Option+F      Fork the current Codex session into the configured pane layout.
+  Option+N      Open a new Codex session using the configured pane layout.
+  Option+W      Force-archive the current Codex session and close its pane.
+  Control+R     Toggle the current persistent pane between read and unread.
+  Option+R      Alias for Control+R.
+
+Environment:
+  CODEX_WS_ROOT  Worktree storage root (default: ~/Worktrees/codex).
+  XDG_CONFIG_HOME  Config root (default: ~/.config).
+  VISUAL, EDITOR  Editor used by config (default: vim).
+`)
+}
+
+const parseOptions = (values, supported) => {
+  const options = {}
+  const positional = []
+
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index]
+    if (!value.startsWith("--")) {
+      positional.push(value)
+      continue
+    }
+
+    if (!supported.has(value)) {
+      fail(`unknown option: ${value}`)
+    }
+
+    if (value === "--base") {
+      const base = values[index + 1]
+      if (!base || base.startsWith("--")) {
+        fail("--base requires a Git ref")
+      }
+      options.base = base
+      index += 1
+      continue
+    }
+
+    options[value.slice(2).replaceAll("-", "_")] = true
+  }
+
+  return { options, positional }
+}
+
+const repository = () => {
+  const topLevel = run("git", ["rev-parse", "--show-toplevel"]).stdout.trim()
+  const commonDirectory = run("git", [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]).stdout.trim()
+  const commonParent = path.basename(commonDirectory) === ".git"
+    ? path.dirname(commonDirectory)
+    : commonDirectory
+  const name = path.basename(commonParent)
+  const slug = name.replaceAll(/[^A-Za-z0-9._-]/g, "-")
+
+  return {
+    topLevel: canonicalPath(topLevel),
+    commonDirectory: canonicalPath(commonDirectory),
+    name,
+    workspaceDirectory: path.join(workspaceRoot, slug),
+  }
+}
+
+const parseWorktrees = (output) => output
+  .trim()
+  .split(/\n\n+/)
+  .filter(Boolean)
+  .map((block) => {
+    const fields = block.split("\n")
+    const worktree = fields.find((line) => line.startsWith("worktree "))?.slice(9)
+    const branch = fields.find((line) => line.startsWith("branch "))?.slice(7) ?? null
+    const prunable = fields.some((line) => line.startsWith("prunable"))
+    return worktree ? { path: canonicalPath(worktree), branch, prunable } : null
+  })
+  .filter((worktree) => worktree !== null)
+
+const worktrees = () => parseWorktrees(
+  run("git", ["worktree", "list", "--porcelain"]).stdout,
+)
+
+const validateName = (name) => {
+  if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    fail("workspace names must contain only letters, numbers, dots, underscores, and hyphens")
+  }
+}
+
+const managedWorkspacePath = (repo, name) => {
+  validateName(name)
+  return canonicalPath(path.join(repo.workspaceDirectory, name))
+}
+
+const resolveWorkspace = (repo, name) => {
+  if (name === ".") {
+    return repo.topLevel
+  }
+
+  const expectedPath = managedWorkspacePath(repo, name)
+  const registered = worktrees().find((worktree) => worktree.path === expectedPath)
+  if (!registered || registered.prunable || !existsSync(expectedPath)) {
+    fail(`workspace ${name} does not exist; create it with: ${commandName} new ${name}`)
+  }
+  return expectedPath
+}
+
+const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value)
+
+const appServerClient = () => {
+  const codex = commandPath("codex")
+  if (!codex) {
+    fail("codex is not available on PATH")
+  }
+
+  const child = spawn(codex, ["app-server"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  })
+  const lines = readline.createInterface({ input: child.stdout })
+  const pending = new Map()
+  let nextId = 0
+  let stderr = ""
+  let closed = false
+
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString()
+    if (stderr.length > 8_000) {
+      stderr = stderr.slice(-8_000)
+    }
+  })
+
+  lines.on("line", (line) => {
+    let message
+    try {
+      message = JSON.parse(line)
+    } catch {
+      return
+    }
+
+    if (!isRecord(message) || typeof message.id !== "number") {
+      return
+    }
+
+    const waiter = pending.get(message.id)
+    if (!waiter) {
+      return
+    }
+
+    pending.delete(message.id)
+    clearTimeout(waiter.timeout)
+    if (isRecord(message.error)) {
+      waiter.reject(new Error(String(message.error.message ?? "app-server request failed")))
+      return
+    }
+    waiter.resolve(message.result)
+  })
+
+  const rejectPending = (message) => {
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timeout)
+      waiter.reject(new Error(message))
+    }
+    pending.clear()
+  }
+
+  child.on("error", (error) => rejectPending(error.message))
+  child.on("exit", (code) => {
+    closed = true
+    if (pending.size > 0) {
+      const detail = stderr.trim()
+      rejectPending(detail || `Codex app-server exited with status ${code}`)
+    }
+  })
+
+  const request = (method, params) => new Promise((resolve, reject) => {
+    if (closed) {
+      reject(new Error("Codex app-server is not running"))
+      return
+    }
+
+    const id = nextId
+    nextId += 1
+    const timeout = setTimeout(() => {
+      pending.delete(id)
+      reject(new Error(`Codex app-server timed out during ${method}`))
+    }, 30_000)
+    pending.set(id, { resolve, reject, timeout })
+    child.stdin.write(`${JSON.stringify({ method, id, params })}\n`)
+  })
+
+  const notify = (method, params) => {
+    child.stdin.write(`${JSON.stringify({ method, params })}\n`)
+  }
+
+  const close = () => {
+    lines.close()
+    child.stdin.end()
+    child.kill()
+  }
+
+  return { request, notify, close }
+}
+
+const initializeAppServerClient = async (client) => {
+  await client.request("initialize", {
+    clientInfo: {
+      name: "codex_ws",
+      title: "Codex Workspace Launcher",
+      version: "0.1.0",
+    },
+  })
+  client.notify("initialized", {})
+}
+
+const processExecutable = (pid) => run("ps", [
+  "-p",
+  String(pid),
+  "-o",
+  "comm=",
+], { allowFailure: true }).stdout.trim()
+
+const processParentId = (pid) => {
+  const value = run("ps", [
+    "-p",
+    String(pid),
+    "-o",
+    "ppid=",
+  ], { allowFailure: true }).stdout.trim()
+  return /^\d+$/.test(value) ? Number(value) : null
+}
+
+const processHasGhosttyAncestor = (pid) => {
+  const visited = new Set()
+  let currentPid = pid
+  while (currentPid > 1 && !visited.has(currentPid)) {
+    visited.add(currentPid)
+    if (path.basename(processExecutable(currentPid)).toLowerCase() === "ghostty") {
+      return true
+    }
+    currentPid = processParentId(currentPid)
+  }
+  return false
+}
+
+const sessionProcessIds = (session) => {
+  const processIds = new Set()
+
+  if (typeof session.path === "string" && existsSync(session.path) && commandPath("lsof")) {
+    const result = run("lsof", ["-t", "--", session.path], { allowFailure: true })
+    if (result.status === 0) {
+      for (const pid of result.stdout.trim().split("\n")) {
+        if (/^\d+$/.test(pid) && path.basename(processExecutable(pid)) === "codex") {
+          processIds.add(pid)
+        }
+      }
+    }
+  }
+
+  if (typeof session.id === "string" && commandPath("pgrep")) {
+    const result = run("pgrep", ["-f", "--", session.id], { allowFailure: true })
+    if (result.status === 0) {
+      for (const pid of result.stdout.trim().split("\n")) {
+        const executable = /^\d+$/.test(pid) ? processExecutable(pid) : ""
+        if (path.basename(executable) === "codex") {
+          processIds.add(pid)
+        }
+      }
+    }
+  }
+
+  return [...processIds]
+}
+
+const sessionIsOpen = (session) => sessionProcessIds(session).length > 0
+
+const processTty = (pid) => {
+  const tty = run("ps", ["-p", String(pid), "-o", "tty="], {
+    allowFailure: true,
+  }).stdout.trim()
+  if (!tty || tty === "??") {
+    return null
+  }
+  return tty.startsWith("/dev/") ? tty : `/dev/${tty}`
+}
+
+const sessionIdForTty = (tty) => {
+  if (!commandPath("lsof")) {
+    return null
+  }
+  const processIds = run("ps", [
+    "-o",
+    "pid=",
+    "-t",
+    path.basename(tty),
+  ], { allowFailure: true }).stdout
+    .trim()
+    .split(/\s+/)
+    .filter((pid) => /^\d+$/.test(pid))
+  const sessionIds = new Set()
+  for (const pid of processIds) {
+    const files = run("lsof", ["-Fn", "-p", pid], { allowFailure: true }).stdout
+    for (const line of files.split("\n")) {
+      const match = line.match(/\/\.codex\/sessions\/.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)
+      if (match) {
+        sessionIds.add(match[1])
+      }
+    }
+  }
+  return sessionIds.size === 1 ? [...sessionIds][0] : null
+}
+
+const tmuxExecutable = () => {
+  const tmux = commandPath("tmux")
+  if (!tmux) {
+    fail("tmux is required when sessionBackend is \"tmux\"")
+  }
+  return tmux
+}
+
+const runTmux = (args, options = {}) => run(tmuxExecutable(), [
+  "-L",
+  tmuxSocketName,
+  "-f",
+  tmuxConfigPath,
+  ...args,
+], options)
+
+const listTmuxRunners = () => {
+  if (!commandPath("tmux")) {
+    return []
+  }
+  const sessionsResult = runTmux([
+    "list-sessions",
+    "-F",
+    "#{session_name}\t#{@ws_workspace}\t#{@ws_thread_id}\t#{@ws_launch_case}\t#{session_created}",
+  ], { allowFailure: true })
+  if (sessionsResult.status !== 0) {
+    return []
+  }
+
+  const panesResult = runTmux([
+    "list-panes",
+    "-a",
+    "-F",
+    "#{session_name}\t#{pane_tty}\t#{pane_pid}\t#{pane_title}\t#{pane_current_command}\t#{@ws_attention_action}\t#{@ws_attention_state}",
+  ], { allowFailure: true })
+  const clientsResult = runTmux([
+    "list-clients",
+    "-F",
+    "#{session_name}\t#{client_tty}",
+  ], { allowFailure: true })
+  const panes = new Map()
+  if (panesResult.status === 0) {
+    for (const line of panesResult.stdout.trim().split("\n").filter(Boolean)) {
+      const [name, paneTty, panePid, paneTitle, paneCurrentCommand, attentionAction, attentionState] = line.split("\t")
+      panes.set(name, {
+        attentionAction,
+        attentionState,
+        paneCurrentCommand,
+        panePid,
+        paneTitle,
+        paneTty,
+      })
+    }
+  }
+  const clients = new Map()
+  if (clientsResult.status === 0) {
+    for (const line of clientsResult.stdout.trim().split("\n").filter(Boolean)) {
+      const [name, clientTty] = line.split("\t")
+      const existing = clients.get(name) ?? []
+      existing.push(clientTty)
+      clients.set(name, existing)
+    }
+  }
+
+  return sessionsResult.stdout.trim().split("\n").filter(Boolean).flatMap((line) => {
+    const [name, workspace, threadId, launchCase, createdAt] = line.split("\t")
+    const pane = panes.get(name)
+    if (!name || !workspace || !pane?.paneTty) {
+      return []
+    }
+    return [{
+      attentionAction: pane.attentionAction,
+      attentionState: pane.attentionState,
+      clientTtys: clients.get(name) ?? [],
+      createdAt: Number(createdAt),
+      launchCase,
+      name,
+      paneCurrentCommand: pane.paneCurrentCommand,
+      panePid: Number(pane.panePid),
+      paneTitle: pane.paneTitle,
+      paneTty: pane.paneTty,
+      threadId: threadId || null,
+      workspace: path.resolve(workspace),
+    }]
+  })
+}
+
+const ghosttyTabSnapshots = () => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "set snapshotRows to {}",
+    "set frontWindowId to \"\"",
+    "if (count of windows) > 0 then set frontWindowId to id of front window",
+    "repeat with candidateWindow in windows",
+    "set candidateTabIndex to 0",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "set candidateTabIndex to candidateTabIndex + 1",
+    "set focusedTerminalId to \"\"",
+    "try",
+    "set focusedTerminalId to id of focused terminal of candidateTab",
+    "end try",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    "set fieldSeparator to ASCII character 9",
+    "set terminalIsFocused to ((id of candidateWindow is frontWindowId) and (id of candidateTab is id of selected tab of candidateWindow) and (id of candidateTerminal is focusedTerminalId))",
+    "set end of snapshotRows to (id of candidateWindow) & fieldSeparator & (id of candidateTab) & fieldSeparator & (name of candidateTab) & fieldSeparator & (candidateTabIndex as text) & fieldSeparator & (tty of candidateTerminal) & fieldSeparator & (terminalIsFocused as text)",
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    "set AppleScript's text item delimiters to linefeed",
+    "return snapshotRows as text",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+  if (result.error || result.status !== 0) {
+    return []
+  }
+
+  const tabs = new Map()
+  for (const line of result.stdout.trim().split("\n").filter(Boolean)) {
+    const [windowId, tabId, tabName, tabIndex, tty, focused] = line.split("\t")
+    if (!windowId || !tabId || !tty) {
+      continue
+    }
+    const existing = tabs.get(tabId) ?? {
+      tabId,
+      tabIndex: Number(tabIndex),
+      tabName,
+      focusedTtys: [],
+      terminalTtys: [],
+      windowId,
+    }
+    existing.terminalTtys.push(tty)
+    if (focused === "true") {
+      existing.focusedTtys.push(tty)
+    }
+    tabs.set(tabId, existing)
+  }
+  return [...tabs.values()]
+}
+
+const codexRunnerIsWorking = (runner) =>
+  /^[\u2800-\u28ff]\s/u.test(runner.paneTitle ?? "")
+  || /^working\b/i.test(runner.paneTitle ?? "")
+
+const loadingFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+const attentionBackground = "#2b405f"
+const attentionBackgroundSequence = `\u001b]11;${attentionBackground}\u001b\\`
+const resetBackgroundSequence = "\u001b]111\u001b\\"
+
+const setTerminalAttentionBackground = (tty, attention) => {
+  if (!/^\/dev\/ttys\d+$/.test(tty)) {
+    return false
+  }
+  const result = spawnSync("/usr/bin/tee", ["-a", tty], {
+    input: attention ? attentionBackgroundSequence : resetBackgroundSequence,
+    stdio: ["pipe", "ignore", "ignore"],
+  })
+  return !result.error && result.status === 0
+}
+
+const workspaceStatusTabTitle = (
+  workspace,
+  runners,
+  runnerStates,
+  loadingFrame,
+) => {
+  const states = runners.map((runner) => runnerStates.get(runner.name))
+  const working = states.filter((state) => state?.working).length
+  const attention = states.filter((state) => state?.needsAttention).length
+  const indicators = [
+    ...(working > 0 ? [`${loadingFrame}${working}`] : []),
+    ...(attention > 0 ? [`🔵${attention}`] : []),
+  ]
+  const status = indicators.length === 0 ? "" : `  ${indicators.join(" ")}`
+  return `${path.basename(workspace)}${status}`
+}
+
+const workspaceForGhosttyTab = (tab, runnersByClientTty) => {
+  const workspaces = new Set(tab.terminalTtys
+    .map((tty) => runnersByClientTty.get(tty)?.workspace)
+    .filter((workspace) => typeof workspace === "string"))
+  return workspaces.size === 1 ? [...workspaces][0] : null
+}
+
+const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
+  const moves = []
+  const windows = new Map()
+  for (const tab of tabs) {
+    const windowTabs = windows.get(tab.windowId) ?? []
+    windowTabs.push(tab)
+    windows.set(tab.windowId, windowTabs)
+  }
+
+  for (const [windowId, unsortedTabs] of windows) {
+    const windowTabs = [...unsortedTabs].sort((left, right) => left.tabIndex - right.tabIndex)
+    if (windowTabs.some((tab) =>
+      tab.tabName === archiveEditorMarker || tab.tabName === newSessionEditorMarker)) {
+      continue
+    }
+    const workspaceByTabId = new Map(windowTabs.map((tab) =>
+      [tab.tabId, workspaceForGhosttyTab(tab, runnersByClientTty)]))
+    const seenWorkspaces = new Set()
+    const desiredTabs = []
+    for (const tab of windowTabs) {
+      const workspace = workspaceByTabId.get(tab.tabId)
+      if (workspace === null) {
+        desiredTabs.push(tab)
+        continue
+      }
+      if (seenWorkspaces.has(workspace)) {
+        continue
+      }
+      seenWorkspaces.add(workspace)
+      desiredTabs.push(...windowTabs.filter((candidate) =>
+        workspaceByTabId.get(candidate.tabId) === workspace))
+    }
+    desiredTabs.forEach((tab, index) => {
+      if (windowTabs[index]?.tabId !== tab.tabId) {
+        moves.push({ tabId: tab.tabId, targetIndex: index + 1, windowId })
+      }
+    })
+  }
+
+  if (moves.length === 0) {
+    return 0
+  }
+
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "set originalWindow to front window",
+    "set originalTab to selected tab of originalWindow",
+    "set originalTerminal to focused terminal of originalTab",
+    ...moves.flatMap((move) => [
+      "set targetWindow to missing value",
+      "repeat with candidateWindow in windows",
+      `if id of candidateWindow is ${appleScriptQuote(move.windowId)} then set targetWindow to candidateWindow`,
+      "end repeat",
+      "if targetWindow is not missing value then",
+      "set targetTab to missing value",
+      "set currentTabIndex to 0",
+      "set candidateTabIndex to 0",
+      "repeat with candidateTab in tabs of targetWindow",
+      "set candidateTabIndex to candidateTabIndex + 1",
+      `if id of candidateTab is ${appleScriptQuote(move.tabId)} then`,
+      "set targetTab to candidateTab",
+      "set currentTabIndex to candidateTabIndex",
+      "end if",
+      "end repeat",
+      `if targetTab is not missing value and currentTabIndex > ${move.targetIndex} then`,
+      "select tab targetTab",
+      "set targetTerminal to focused terminal of targetTab",
+      `repeat (currentTabIndex - ${move.targetIndex}) times`,
+      `perform action ${appleScriptQuote("move_tab:-1")} on targetTerminal`,
+      "end repeat",
+      "end if",
+      "end if",
+    ]),
+    "try",
+    "select tab originalTab",
+    "focus originalTerminal",
+    "activate window originalWindow",
+    "end try",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+  return result.error || result.status !== 0 ? 0 : moves.length
+}
+
+const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
+  const runnersByClientTty = new Map()
+  const allRunners = listTmuxRunners()
+  for (const runner of allRunners) {
+    for (const tty of runner.clientTtys) {
+      runnersByClientTty.set(tty, runner)
+    }
+  }
+
+  const tabs = ghosttyTabSnapshots()
+  const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
+  const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
+  const visibleRunnerNames = new Set()
+  for (const runner of allRunners) {
+    const visible = runner.clientTtys.some((tty) => visibleTtys.has(tty))
+    if (!visible) {
+      continue
+    }
+    visibleRunnerNames.add(runner.name)
+    const working = codexRunnerIsWorking(runner)
+    const focused = runner.clientTtys.some((tty) => focusedTtys.has(tty))
+    const previous = runnerStates.get(runner.name)
+    const focusChanged = focused && previous?.focused !== true
+    const manualAction = runner.attentionAction?.split(":", 1)[0]
+    const startedWorking = working && previous?.working !== true
+    const manualUnread = manualAction === "read"
+      || focusChanged
+      || (startedWorking && manualAction !== "unread")
+      ? false
+      : manualAction === "unread"
+        ? true
+        : previous?.manualUnread ?? false
+    const needsAttention = manualAction === "unread"
+      ? true
+      : manualAction === "read"
+        ? false
+        : manualUnread
+          ? true
+          : working
+            ? false
+            : focused
+              ? false
+              : previous?.working
+                ? true
+                : previous?.needsAttention ?? runner.attentionState !== "read"
+    const currentTtys = runner.clientTtys.filter((tty) => visibleTtys.has(tty))
+    const tintedTtys = new Set(previous?.tintedTtys ?? [])
+    if (needsAttention) {
+      for (const tty of currentTtys) {
+        if (!tintedTtys.has(tty) && setTerminalAttentionBackground(tty, true)) {
+          tintedTtys.add(tty)
+        }
+      }
+    } else if (previous === undefined || tintedTtys.size > 0) {
+      for (const tty of new Set([...currentTtys, ...tintedTtys])) {
+        setTerminalAttentionBackground(tty, false)
+      }
+      tintedTtys.clear()
+    }
+    const attentionState = needsAttention
+      ? "unread"
+      : working
+        ? "working"
+        : "read"
+    if (runner.attentionState !== attentionState) {
+      runTmux([
+        "set-option",
+        "-p",
+        "-t",
+        runner.name,
+        "@ws_attention_state",
+        attentionState,
+      ], { allowFailure: true })
+    }
+    if (runner.attentionAction) {
+      runTmux([
+        "set-option",
+        "-pu",
+        "-t",
+        runner.name,
+        "@ws_attention_action",
+      ], { allowFailure: true })
+    }
+    runnerStates.set(runner.name, {
+      focused,
+      manualUnread,
+      needsAttention,
+      tintedTtys: [...tintedTtys],
+      working,
+    })
+  }
+  for (const runnerName of runnerStates.keys()) {
+    if (!visibleRunnerNames.has(runnerName)) {
+      for (const tty of runnerStates.get(runnerName)?.tintedTtys ?? []) {
+        setTerminalAttentionBackground(tty, false)
+      }
+      runnerStates.delete(runnerName)
+    }
+  }
+
+  let visibleWorkspace = false
+  let working = false
+  const updates = tabs.flatMap((tab) => {
+    if (tab.tabName === archiveEditorMarker || tab.tabName === newSessionEditorMarker) {
+      return []
+    }
+    const runners = [...new Map(tab.terminalTtys
+      .map((tty) => runnersByClientTty.get(tty))
+      .filter((runner) => runner !== undefined)
+      .map((runner) => [runner.name, runner])).values()]
+    const workspace = workspaceForGhosttyTab(tab, runnersByClientTty)
+    if (runners.length === 0 || workspace === null) {
+      return []
+    }
+    visibleWorkspace = true
+    working ||= runners.some((runner) => runnerStates.get(runner.name)?.working)
+    const title = workspaceStatusTabTitle(
+      workspace,
+      runners,
+      runnerStates,
+      loadingFrame,
+    )
+    return title === tab.tabName ? [] : [{ tabId: tab.tabId, title }]
+  })
+  let updated = 0
+  if (updates.length > 0) {
+    const script = [
+      'using terms from application "Ghostty"',
+      'tell application "Ghostty"',
+      "repeat with candidateWindow in windows",
+      "repeat with candidateTab in tabs of candidateWindow",
+      ...updates.flatMap((update) => [
+        `if id of candidateTab is ${appleScriptQuote(update.tabId)} then`,
+        `perform action ${appleScriptQuote(`set_tab_title:${update.title}`)} on focused terminal of candidateTab`,
+        "end if",
+      ]),
+      "end repeat",
+      "end repeat",
+      "end tell",
+      "end using terms from",
+    ].join("\n")
+    const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+    updated = result.error || result.status !== 0 ? 0 : updates.length
+  }
+  groupGhosttyWorkspaceTabs(tabs, runnersByClientTty)
+  return {
+    updated,
+    visibleWorkspace,
+    working,
+  }
+}
+
+const titleDaemonProcessIsRunning = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return false
+  }
+  const result = run("ps", ["-p", String(pid), "-o", "command="], { allowFailure: true })
+  return result.status === 0 && result.stdout.includes("title-daemon")
+}
+
+const recordedTitleDaemonPid = () => {
+  if (!existsSync(titleDaemonPidPath)) {
+    return null
+  }
+  const pid = Number.parseInt(readFileSync(titleDaemonPidPath, "utf8").trim(), 10)
+  return Number.isInteger(pid) ? pid : null
+}
+
+const ensureTitleDaemon = () => {
+  const recordedPid = recordedTitleDaemonPid()
+  if (recordedPid !== null && titleDaemonProcessIsRunning(recordedPid)) {
+    return
+  }
+  rmSync(titleDaemonPidPath, { force: true })
+  mkdirSync(configDirectory, { recursive: true })
+  const child = spawn(process.execPath, [process.argv[1], "title-daemon"], {
+    cwd: homedir(),
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
+}
+
+const runTitleDaemon = async () => {
+  const recordedPid = recordedTitleDaemonPid()
+  if (recordedPid !== null
+    && recordedPid !== process.pid
+    && titleDaemonProcessIsRunning(recordedPid)) {
+    return
+  }
+  mkdirSync(configDirectory, { recursive: true })
+  writeFileSync(titleDaemonPidPath, `${process.pid}\n`)
+  process.on("exit", () => {
+    if (recordedTitleDaemonPid() === process.pid) {
+      rmSync(titleDaemonPidPath, { force: true })
+    }
+  })
+
+  let loadingFrameIndex = 0
+  const runnerStates = new Map()
+  while (true) {
+    const result = updateGhosttyTabTitles(
+      runnerStates,
+      loadingFrames[loadingFrameIndex],
+    )
+    loadingFrameIndex = result.working
+      ? (loadingFrameIndex + 1) % loadingFrames.length
+      : 0
+    await waitMilliseconds(result.visibleWorkspace ? 250 : 1_000)
+  }
+}
+
+const tmuxRunnersForWorkspace = (workspace, runners = listTmuxRunners()) => {
+  const resolvedWorkspace = path.resolve(workspace)
+  return runners.filter((runner) => runner.workspace === resolvedWorkspace)
+}
+
+const tmuxRunnerForSession = (session, runners = listTmuxRunners()) => {
+  const namedRunner = runners.find((runner) => runner.threadId === session.id)
+  if (namedRunner) {
+    return namedRunner
+  }
+  const processTtys = new Set(sessionProcessIds(session)
+    .map(processTty)
+    .filter((tty) => tty !== null))
+  const discoveredRunner = runners.find((runner) => processTtys.has(runner.paneTty))
+  if (discoveredRunner && discoveredRunner.threadId !== session.id) {
+    runTmux([
+      "set-option",
+      "-t",
+      discoveredRunner.name,
+      "@ws_thread_id",
+      session.id,
+    ])
+    discoveredRunner.threadId = session.id
+  }
+  return discoveredRunner ?? null
+}
+
+const currentTmuxRunner = () => {
+  if (!process.env.TMUX || !commandPath("tmux")) {
+    return null
+  }
+  const result = run("tmux", [
+    "display-message",
+    "-p",
+    "#{session_name}",
+  ], { allowFailure: true })
+  if (result.status !== 0 || !result.stdout.trim()) {
+    return null
+  }
+  return listTmuxRunners().find((runner) => runner.name === result.stdout.trim()) ?? null
+}
+
+const currentGhosttyTty = () => {
+  const processTerminal = processTty(process.pid)
+  if (!process.env.TMUX || !commandPath("tmux")) {
+    return processTerminal
+  }
+  const result = run("tmux", [
+    "display-message",
+    "-p",
+    "#{client_tty}",
+  ], { allowFailure: true })
+  return result.status === 0 && result.stdout.trim()
+    ? result.stdout.trim()
+    : currentTmuxRunner()?.clientTtys[0] ?? processTerminal
+}
+
+const tmuxRunnerName = (workspace) => {
+  const workspaceKey = createHash("sha256")
+    .update(path.resolve(workspace))
+    .digest("hex")
+    .slice(0, 10)
+  return `ws-${workspaceKey}-${randomUUID().slice(0, 8)}`
+}
+
+const freshLaunch = () => ({ case: "fresh" })
+const resumeLaunch = (session) => ({ case: "resume", session })
+const forkLaunch = (session) => ({ case: "fork", session })
+const attachLaunch = (runner, session = null) => ({ case: "attach", runner, session })
+
+const codexArgumentsForLaunch = (launch) => {
+  switch (launch.case) {
+    case "fresh":
+      return []
+    case "resume":
+      return ["resume", launch.session.id]
+    case "fork":
+      return ["fork", launch.session.id]
+    case "attach":
+      fail("an attached tmux runner does not have Codex launch arguments")
+  }
+}
+
+const startTmuxRunner = (workspace, launch) => {
+  if (!existsSync(tmuxConfigPath)) {
+    fail(`missing tmux config: ${tmuxConfigPath}`)
+  }
+  const codex = commandPath("codex")
+  if (!codex) {
+    fail("codex is not available on PATH")
+  }
+  const name = tmuxRunnerName(workspace)
+  const codexCommand = [codex, "-C", workspace, ...codexArgumentsForLaunch(launch)]
+    .map(shellQuote)
+    .join(" ")
+  const innerCommand = `unset NO_COLOR; cd ${shellQuote(workspace)} && CODEX_WS_RUNNER=${shellQuote(name)} VISUAL=${shellQuote(forkEditorCommand)} exec ${codexCommand}`
+  runTmux([
+    "new-session",
+    "-d",
+    "-s",
+    name,
+    "-c",
+    workspace,
+    `/bin/zsh -lc ${shellQuote(innerCommand)}`,
+  ])
+  const threadId = launch.case === "resume" ? launch.session.id : ""
+  for (const [option, value] of [
+    ["@ws_workspace", path.resolve(workspace)],
+    ["@ws_thread_id", threadId],
+    ["@ws_launch_case", launch.case],
+  ]) {
+    runTmux(["set-option", "-t", name, option, value])
+  }
+  return listTmuxRunners().find((runner) => runner.name === name) ?? {
+    clientTtys: [],
+    launchCase: launch.case,
+    name,
+    paneTty: "",
+    threadId: threadId || null,
+    workspace: path.resolve(workspace),
+  }
+}
+
+const tmuxAttachSurfaceCommand = (runner) => {
+  const attachCommand = [
+    tmuxExecutable(),
+    "-L",
+    tmuxSocketName,
+    "-f",
+    tmuxConfigPath,
+    "attach-session",
+    "-t",
+    runner.name,
+  ].map(shellQuote).join(" ")
+  const shellCommand = `unset NO_COLOR; ${attachCommand}; exec /bin/zsh -l`
+  return `/bin/zsh -lc ${shellQuote(shellCommand)}`
+}
+
+const directSurfaceCommand = (workspace, launch) => {
+  const codex = commandPath("codex")
+  if (!codex) {
+    fail("codex is not available on PATH")
+  }
+  const codexCommand = [codex, "-C", workspace, ...codexArgumentsForLaunch(launch)]
+    .map(shellQuote)
+    .join(" ")
+  const shellCommand = `unset NO_COLOR; cd ${shellQuote(workspace)} && VISUAL=${shellQuote(forkEditorCommand)} ${codexCommand}; exec /bin/zsh -l`
+  return `/bin/zsh -lc ${shellQuote(shellCommand)}`
+}
+
+const surfaceCommandForLaunch = (workspace, launch, sessionBackend = readConfig().sessionBackend) => {
+  if (launch.case === "attach") {
+    return tmuxAttachSurfaceCommand(launch.runner)
+  }
+  switch (sessionBackend) {
+    case "direct":
+      return directSurfaceCommand(workspace, launch)
+    case "tmux": {
+      const runner = (() => {
+        switch (launch.case) {
+          case "resume":
+            return listTmuxRunners().find((candidate) =>
+              candidate.threadId === launch.session.id)
+              ?? startTmuxRunner(workspace, launch)
+          case "fork":
+          case "fresh":
+            return startTmuxRunner(workspace, launch)
+          case "attach":
+            return launch.runner
+        }
+      })()
+      return tmuxAttachSurfaceCommand(runner)
+    }
+  }
+}
+
+const killTmuxRunner = (runnerName) => {
+  runTmux(["kill-session", "-t", runnerName], { allowFailure: true })
+}
+
+const setRunnerAttention = (runnerName, action) => {
+  if (!/^[A-Za-z0-9_.-]+$/.test(runnerName)) {
+    fail("invalid tmux runner name")
+  }
+  if (!listTmuxRunners().some((runner) => runner.name === runnerName)) {
+    fail(`tmux runner ${runnerName} does not exist`)
+  }
+  runTmux([
+    "set-option",
+    "-p",
+    "-t",
+    runnerName,
+    "@ws_attention_action",
+    `${action}:${Date.now()}`,
+  ])
+}
+
+const toggleRunnerAttention = (runnerName) => {
+  const stateResult = runTmux([
+    "show-options",
+    "-pv",
+    "-t",
+    runnerName,
+    "@ws_attention_state",
+  ], { allowFailure: true })
+  const action = stateResult.status === 0 && stateResult.stdout.trim() === "unread"
+    ? "read"
+    : "unread"
+  setRunnerAttention(runnerName, action)
+}
+
+const ghosttyTerminalTtys = () => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    'set terminalTtys to {}',
+    'repeat with candidateTerminal in terminals',
+    'set end of terminalTtys to tty of candidateTerminal',
+    'end repeat',
+    'set AppleScript\'s text item delimiters to linefeed',
+    'return terminalTtys as text',
+    'end tell',
+    'end using terms from',
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    return null
+  }
+  return new Set(result.stdout.split("\n").map((tty) => tty.trim()).filter(Boolean))
+}
+
+const terminateDetachedTtys = (ttys) => {
+  const ttyNames = [...new Set(ttys.map((tty) => path.basename(tty)))]
+  for (const tty of ttyNames) {
+    run("pkill", ["-TERM", "-t", tty], { allowFailure: true })
+  }
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const remaining = ttyNames.filter((tty) =>
+      run("pgrep", ["-t", tty], { allowFailure: true }).status === 0)
+    if (remaining.length === 0) {
+      return
+    }
+    run("sleep", ["0.05"])
+  }
+
+  for (const tty of ttyNames) {
+    run("pkill", ["-KILL", "-t", tty], { allowFailure: true })
+  }
+}
+
+const focusGhosttyTtys = (ttys) => {
+  if (ttys.length === 0) {
+    return false
+  }
+
+  const ttyChecks = ttys.flatMap((tty) => [
+    `if tty of candidateTerminal is ${appleScriptQuote(tty)} then`,
+    "focus candidateTerminal",
+    "return true",
+    "end if",
+  ])
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateTerminal in terminals",
+    ...ttyChecks,
+    "end repeat",
+    "return false",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+
+  return result.status === 0 && result.stdout.trim() === "true"
+}
+
+const focusCodexSession = (session, dryRun) => {
+  if (dryRun) {
+    process.stdout.write(`[dry-run] would focus ${sessionLabel(session)}\n`)
+    return true
+  }
+
+  const runner = tmuxRunnerForSession(session)
+  const ttys = runner
+    ? runner.clientTtys
+    : sessionProcessIds(session)
+      .map(processTty)
+      .filter((tty) => tty !== null)
+  return focusGhosttyTtys(ttys)
+}
+
+const isThread = (value) => isRecord(value)
+  && typeof value.id === "string"
+  && typeof value.cwd === "string"
+  && typeof value.updatedAt === "number"
+
+const pathContains = (parent, child) => {
+  const relative = path.relative(parent, child)
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
+}
+
+const listSessions = async (workspace) => {
+  const client = appServerClient()
+
+  try {
+    await initializeAppServerClient(client)
+
+    const sessions = []
+    let cursor = null
+    do {
+      const result = await client.request("thread/list", {
+        archived: false,
+        cursor,
+        limit: 100,
+        sortDirection: "desc",
+        sortKey: "updated_at",
+        useStateDbOnly: false,
+      })
+      if (!isRecord(result) || !Array.isArray(result.data)) {
+        throw new Error("Codex app-server returned an invalid thread list")
+      }
+
+      sessions.push(...result.data.filter(isThread))
+      cursor = typeof result.nextCursor === "string" ? result.nextCursor : null
+    } while (cursor)
+
+    const canonicalWorkspace = canonicalPath(workspace)
+    return sessions
+      .filter((thread) => !thread.ephemeral)
+      .filter((thread) => thread.parentThreadId === null || thread.parentThreadId === undefined)
+      .filter((thread) => pathContains(canonicalWorkspace, canonicalPath(thread.cwd)))
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+  } finally {
+    client.close()
+  }
+}
+
+const sessionsInStableOrder = (sessions) => [...sessions].sort((left, right) => {
+  const leftCreatedAt = typeof left.createdAt === "number" ? left.createdAt : left.updatedAt
+  const rightCreatedAt = typeof right.createdAt === "number" ? right.createdAt : right.updatedAt
+  return leftCreatedAt - rightCreatedAt || left.id.localeCompare(right.id)
+})
+
+const archiveSessions = async (sessions) => {
+  if (sessions.length === 0) {
+    return
+  }
+
+  const client = appServerClient()
+  try {
+    await initializeAppServerClient(client)
+    for (const session of sessions) {
+      await client.request("thread/archive", { threadId: session.id })
+    }
+  } finally {
+    client.close()
+  }
+}
+
+const ghosttyTerminalId = (tty) => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if tty of candidateTerminal is ${appleScriptQuote(tty)} then return id of candidateTerminal`,
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    "return \"\"",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    return null
+  }
+  return result.stdout.trim() || null
+}
+
+const ghosttyTerminalLocation = (tty) => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if tty of candidateTerminal is ${appleScriptQuote(tty)} then`,
+    "set tabTerminalIds to {}",
+    "repeat with tabTerminal in terminals of candidateTab",
+    "set end of tabTerminalIds to id of tabTerminal",
+    "end repeat",
+    "set AppleScript's text item delimiters to \"|\"",
+    "set fieldSeparator to ASCII character 9",
+    "return (id of candidateWindow) & fieldSeparator & (id of candidateTab) & fieldSeparator & (id of candidateTerminal) & fieldSeparator & (tabTerminalIds as text) & fieldSeparator & (name of candidateTab)",
+    "end if",
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    "return \"\"",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0 || !result.stdout.trim()) {
+    return null
+  }
+  const [windowId, tabId, terminalId, encodedTerminalIds, ...tabNameParts] = result.stdout.trim().split("\t")
+  if (!windowId || !tabId || !terminalId || encodedTerminalIds === undefined) {
+    return null
+  }
+  return {
+    tabId,
+    tabName: tabNameParts.join("\t"),
+    tabTerminalIds: encodedTerminalIds.split("|").filter(Boolean),
+    terminalId,
+    windowId,
+  }
+}
+
+const ghosttyTabLayout = (tabId) => {
+  const neighborLines = (direction) => [
+    "focus sourceTerminal",
+    "delay 0.03",
+    `perform action ${appleScriptQuote(`goto_split:${direction}`)} on sourceTerminal`,
+    "delay 0.03",
+    "set neighborTerminal to focused terminal of targetTab",
+    `if id of neighborTerminal is not sourceId then set ${direction}Id to id of neighborTerminal`,
+  ]
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "set originalWindow to front window",
+    "set originalTab to selected tab of originalWindow",
+    "set originalTerminal to focused terminal of originalTab",
+    "set targetTab to missing value",
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    `if id of candidateTab is ${appleScriptQuote(tabId)} then set targetTab to candidateTab`,
+    "end repeat",
+    "end repeat",
+    "if targetTab is missing value then return \"\"",
+    "set targetOriginalTerminal to focused terminal of targetTab",
+    "set layoutRows to {}",
+    "repeat with sourceTerminal in terminals of targetTab",
+    "set sourceId to id of sourceTerminal",
+    "set leftId to \"-\"",
+    "set rightId to \"-\"",
+    "set upId to \"-\"",
+    "set downId to \"-\"",
+    ...neighborLines("left"),
+    ...neighborLines("right"),
+    ...neighborLines("up"),
+    ...neighborLines("down"),
+    "set fieldSeparator to ASCII character 9",
+    "set end of layoutRows to sourceId & fieldSeparator & leftId & fieldSeparator & rightId & fieldSeparator & upId & fieldSeparator & downId",
+    "end repeat",
+    "try",
+    "focus targetOriginalTerminal",
+    "end try",
+    "try",
+    "select tab originalTab",
+    "focus originalTerminal",
+    "activate window originalWindow",
+    "end try",
+    "set AppleScript's text item delimiters to linefeed",
+    "return layoutRows as text",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0 || !result.stdout.trim()) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not inspect the Ghostty pane layout")
+  }
+
+  const panes = result.stdout.trim().split("\n").map((line) => {
+    const [id, left, right, up, down] = line.split("\t")
+    if (!id || left === undefined || right === undefined || up === undefined || down === undefined) {
+      fail("Ghostty returned an invalid pane layout")
+    }
+    return {
+      down: down === "-" ? "" : down,
+      id,
+      left: left === "-" ? "" : left,
+      right: right === "-" ? "" : right,
+      up: up === "-" ? "" : up,
+    }
+  })
+  return {
+    panes,
+    terminalIds: panes.map((pane) => pane.id),
+  }
+}
+
+const paneNeighbor = (layout, terminalId, directions) => {
+  const pane = layout.panes.find((candidate) => candidate.id === terminalId)
+  if (!pane) {
+    return null
+  }
+  for (const direction of directions) {
+    if (pane[direction]) {
+      return pane[direction]
+    }
+  }
+  return null
+}
+
+const paneHasNeighbor = (layout, terminalId, directions) =>
+  paneNeighbor(layout, terminalId, directions) !== null
+
+const topLeftTerminalId = (layout, candidates) => {
+  const candidateIds = new Set(candidates)
+  return layout.terminalIds.find((terminalId) => {
+    if (!candidateIds.has(terminalId)) {
+      return false
+    }
+    const pane = layout.panes.find((candidate) => candidate.id === terminalId)
+    return pane && !pane.left && !pane.up
+  }) ?? layout.terminalIds.find((terminalId) => candidateIds.has(terminalId)) ?? null
+}
+
+const spatialTerminalOrder = (layout, candidates) => {
+  const candidateIds = new Set(candidates)
+  const first = topLeftTerminalId(layout, candidates)
+  if (!first) {
+    return []
+  }
+  const visited = new Set()
+  const pending = [first]
+  const ordered = []
+  while (pending.length > 0) {
+    const terminalId = pending.shift()
+    if (!terminalId || visited.has(terminalId)) {
+      continue
+    }
+    visited.add(terminalId)
+    if (candidateIds.has(terminalId)) {
+      ordered.push(terminalId)
+    }
+    const pane = layout.panes.find((candidate) => candidate.id === terminalId)
+    if (pane) {
+      pending.push(pane.right, pane.down, pane.left, pane.up)
+    }
+  }
+  for (const terminalId of layout.terminalIds) {
+    if (candidateIds.has(terminalId) && !visited.has(terminalId)) {
+      ordered.push(terminalId)
+    }
+  }
+  return ordered
+}
+
+const singlePaneLayout = (terminalId) => ({
+  panes: [{ down: "", id: terminalId, left: "", right: "", up: "" }],
+  terminalIds: [terminalId],
+})
+
+const paneLayoutProvider = (paneLayout) => {
+  const existing = (terminalId) => ({ case: "existing", terminalId })
+  const created = (index) => ({ case: "created", index })
+  const hasHorizontalEdge = (layout) => layout.terminalIds.some((terminalId) =>
+    paneHasNeighbor(layout, terminalId, ["left", "right"]))
+  const hasVerticalEdge = (layout) => layout.terminalIds.some((terminalId) =>
+    paneHasNeighbor(layout, terminalId, ["up", "down"]))
+
+  switch (paneLayout) {
+    case "1x1":
+      return {
+        canCompleteWithoutMoving: () => false,
+        capacity: 1,
+        isCompatible: (layout) => layout.terminalIds.length <= 1,
+        placements: () => [],
+      }
+    case "1x2":
+      return {
+        canCompleteWithoutMoving: () => false,
+        capacity: 2,
+        isCompatible: (layout) => layout.terminalIds.length <= 1
+          || (layout.terminalIds.length === 2
+            && hasHorizontalEdge(layout)
+            && !hasVerticalEdge(layout)),
+        placements: (layout) => layout.terminalIds.length === 1
+          ? [{ direction: "right", target: existing(layout.terminalIds[0]) }]
+          : [],
+      }
+    case "2x1":
+      return {
+        canCompleteWithoutMoving: () => false,
+        capacity: 2,
+        isCompatible: (layout) => layout.terminalIds.length <= 1
+          || (layout.terminalIds.length === 2
+            && hasVerticalEdge(layout)
+            && !hasHorizontalEdge(layout)),
+        placements: (layout) => layout.terminalIds.length === 1
+          ? [{ direction: "down", target: existing(layout.terminalIds[0]) }]
+          : [],
+      }
+    case "2x2": {
+      const isCompatible = (layout) => {
+        switch (layout.terminalIds.length) {
+          case 0:
+          case 1:
+            return true
+          case 2:
+            return hasHorizontalEdge(layout) && !hasVerticalEdge(layout)
+          case 3:
+            return hasHorizontalEdge(layout) && hasVerticalEdge(layout)
+          case 4:
+            return layout.terminalIds.every((terminalId) =>
+              paneHasNeighbor(layout, terminalId, ["left", "right"])
+                && paneHasNeighbor(layout, terminalId, ["up", "down"]))
+          default:
+            return false
+        }
+      }
+      const placements = (layout) => {
+        const terminalIds = layout.terminalIds
+        switch (terminalIds.length) {
+          case 1:
+            return [
+              { direction: "right", target: existing(terminalIds[0]) },
+              { direction: "down", target: existing(terminalIds[0]) },
+              { direction: "down", target: created(0) },
+            ]
+          case 2: {
+            const leftTerminalId = terminalIds.find((terminalId) => {
+              const pane = layout.panes.find((candidate) => candidate.id === terminalId)
+              return pane && !pane.left && pane.right
+            })
+            if (leftTerminalId) {
+              const rightTerminalId = paneNeighbor(layout, leftTerminalId, ["right"])
+              return rightTerminalId
+                ? [
+                  { direction: "down", target: existing(leftTerminalId) },
+                  { direction: "down", target: existing(rightTerminalId) },
+                ]
+                : []
+            }
+            const topTerminalId = terminalIds.find((terminalId) => {
+              const pane = layout.panes.find((candidate) => candidate.id === terminalId)
+              return pane && !pane.up && pane.down
+            })
+            if (!topTerminalId) {
+              return []
+            }
+            const bottomTerminalId = paneNeighbor(layout, topTerminalId, ["down"])
+            return bottomTerminalId
+              ? [
+                { direction: "right", target: existing(topTerminalId) },
+                { direction: "right", target: existing(bottomTerminalId) },
+              ]
+              : []
+          }
+          case 3: {
+            if (!isCompatible(layout)) {
+              return []
+            }
+            const singletonTerminalId = spatialTerminalOrder(layout, terminalIds)
+              .find((terminalId) => !paneHasNeighbor(layout, terminalId, ["up", "down"]))
+            return singletonTerminalId
+              ? [{ direction: "down", target: existing(singletonTerminalId) }]
+              : []
+          }
+          default:
+            return []
+        }
+      }
+      return {
+        canCompleteWithoutMoving: (layout, pendingPaneCount) =>
+          layout.terminalIds.length === 2
+            && pendingPaneCount > 0
+            && hasVerticalEdge(layout)
+            && !hasHorizontalEdge(layout),
+        capacity: 4,
+        isCompatible,
+        placements,
+      }
+    }
+    default:
+      fail(`unsupported pane layout: ${paneLayout}`)
+  }
+}
+
+const closeGhosttyTerminal = (terminalId) => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if id of candidateTerminal is ${appleScriptQuote(terminalId)} then`,
+    "try",
+    "if (count of terminals of candidateTab) > 1 then",
+    "close candidateTerminal",
+    "else if (count of tabs of candidateWindow) > 1 then",
+    "close tab candidateTab",
+    "else",
+    "close window candidateWindow",
+    "end if",
+    "return \"requested\"",
+    "on error",
+    "return \"retry\"",
+    "end try",
+    "end if",
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    "return \"missing\"",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    return "retry"
+  }
+  switch (result.stdout.trim()) {
+    case "missing":
+    case "requested":
+      return result.stdout.trim()
+    default:
+      return "retry"
+  }
+}
+
+const waitMilliseconds = (milliseconds) => new Promise((resolve) => {
+  setTimeout(resolve, milliseconds)
+})
+
+const ttyProcessIds = (tty) => run("ps", [
+  "-o",
+  "pid=",
+  "-t",
+  path.basename(tty),
+], { allowFailure: true }).stdout
+  .trim()
+  .split(/\s+/)
+  .filter((pid) => /^\d+$/.test(pid))
+
+const signalTtyProcesses = (tty, signal) => {
+  const processes = ttyProcessIds(tty)
+  if (processes.length > 0) {
+    run("kill", [signal, ...processes], { allowFailure: true })
+  }
+}
+
+const waitForTtyProcesses = async (tty, timeoutMilliseconds) => {
+  const deadline = Date.now() + timeoutMilliseconds
+  while (Date.now() < deadline) {
+    if (ttyProcessIds(tty).length === 0) {
+      return true
+    }
+    await waitMilliseconds(10)
+  }
+  return ttyProcessIds(tty).length === 0
+}
+
+const forceCloseGhosttyTerminal = async (tty, terminalId) => {
+  if (!/^\/dev\/ttys\d+$/.test(tty)) {
+    fail(`invalid Ghostty TTY: ${tty}`)
+  }
+  if (!terminalId) {
+    fail("close-tty requires a Ghostty terminal ID")
+  }
+
+  signalTtyProcesses(tty, "-TERM")
+  if (!await waitForTtyProcesses(tty, 50)) {
+    signalTtyProcesses(tty, "-KILL")
+    await waitForTtyProcesses(tty, 150)
+  }
+
+  const closeDeadline = Date.now() + 500
+  while (Date.now() < closeDeadline) {
+    const closeResult = closeGhosttyTerminal(terminalId)
+    if (closeResult === "missing") {
+      return
+    }
+    await waitMilliseconds(10)
+  }
+}
+
+const scheduleGhosttyTerminalClose = (tty, terminalId) => {
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    "close-tty",
+    tty,
+    terminalId,
+  ], {
+    cwd: homedir(),
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
+}
+
+const scheduleTmuxRunnerClose = (runnerName, tty, terminalId) => {
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    "close-runner",
+    runnerName,
+    tty,
+    terminalId,
+  ], {
+    cwd: homedir(),
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
+}
+
+const archiveCurrentSession = async (repo) => {
+  const sourceProcessTty = processTty(process.pid)
+  const sourceGhosttyTty = currentGhosttyTty()
+  if (!sourceProcessTty || !sourceGhosttyTty) {
+    fail("archive-current must be run from a Codex terminal")
+  }
+
+  const openSessionId = sessionIdForTty(sourceProcessTty)
+  const matchingSessions = openSessionId
+    ? [{ id: openSessionId }]
+    : (await listSessions(repo.topLevel)).filter((session) => sessionProcessIds(session)
+      .some((pid) => processTty(pid) === sourceProcessTty))
+  if (matchingSessions.length !== 1) {
+    fail(`expected one Codex session on ${sourceProcessTty}, found ${matchingSessions.length}`)
+  }
+  const sourceTerminalId = ghosttyTerminalId(sourceGhosttyTty)
+  if (!sourceTerminalId) {
+    fail(`could not find the Ghostty terminal for ${sourceGhosttyTty}`)
+  }
+  const runner = currentTmuxRunner()
+  await archiveSessions(matchingSessions)
+  if (runner) {
+    scheduleTmuxRunnerClose(runner.name, sourceGhosttyTty, sourceTerminalId)
+  } else {
+    scheduleGhosttyTerminalClose(sourceGhosttyTty, sourceTerminalId)
+  }
+}
+
+const transferSession = async (repo, sessionId, operation) => {
+  const client = appServerClient()
+  try {
+    await initializeAppServerClient(client)
+    const sourceResult = await client.request("thread/read", {
+      includeTurns: false,
+      threadId: sessionId,
+    })
+    if (!isRecord(sourceResult) || !isThread(sourceResult.thread)) {
+      throw new Error("Codex app-server returned an invalid source session")
+    }
+
+    const sourceSession = sourceResult.thread
+    if (operation === "move" && canonicalPath(sourceSession.cwd) === repo.topLevel) {
+      fail(`session ${sessionId} is already in ${repo.topLevel}`)
+    }
+
+    const sourceRunner = tmuxRunnerForSession(sourceSession)
+    const sourceTtys = sourceRunner
+      ? sourceRunner.clientTtys
+      : [...new Set(
+        sessionProcessIds(sourceSession)
+          .map(processTty)
+          .filter((tty) => tty !== null),
+      )]
+    const sourceTerminals = sourceTtys
+      .map((tty) => ({ terminalId: ghosttyTerminalId(tty), tty }))
+      .filter((terminal) => terminal.terminalId !== null)
+    const forkResult = await client.request("thread/fork", {
+      cwd: repo.topLevel,
+      ephemeral: false,
+      threadId: sessionId,
+    })
+    if (!isRecord(forkResult) || !isThread(forkResult.thread)) {
+      throw new Error("Codex app-server returned an invalid copied session")
+    }
+
+    const copiedResult = await client.request("thread/read", {
+      includeTurns: false,
+      threadId: forkResult.thread.id,
+    })
+    if (!isRecord(copiedResult) || !isThread(copiedResult.thread)) {
+      throw new Error("Codex app-server could not re-read the copied session")
+    }
+    const copiedSession = copiedResult.thread
+    if (canonicalPath(copiedSession.cwd) !== repo.topLevel) {
+      throw new Error(`Codex copied the session into ${copiedSession.cwd} instead of ${repo.topLevel}`)
+    }
+    if (typeof sourceSession.name === "string"
+      && sourceSession.name.trim()
+      && sourceSession.name !== copiedSession.name) {
+      await client.request("thread/name/set", {
+        name: sourceSession.name,
+        threadId: copiedSession.id,
+      })
+    }
+
+    switch (operation) {
+      case "copy":
+        process.stdout.write(`Copied ${sessionId} to ${copiedSession.id} in ${repo.topLevel}.\n`)
+        break
+      case "move":
+        await client.request("thread/archive", { threadId: sessionId })
+        if (sourceRunner) {
+          const [firstTerminal, ...otherTerminals] = sourceTerminals
+          if (firstTerminal) {
+            scheduleTmuxRunnerClose(
+              sourceRunner.name,
+              firstTerminal.tty,
+              firstTerminal.terminalId,
+            )
+          } else {
+            killTmuxRunner(sourceRunner.name)
+          }
+          for (const terminal of otherTerminals) {
+            scheduleGhosttyTerminalClose(terminal.tty, terminal.terminalId)
+          }
+        } else {
+          for (const terminal of sourceTerminals) {
+            scheduleGhosttyTerminalClose(terminal.tty, terminal.terminalId)
+          }
+        }
+        process.stdout.write(`Moved ${sessionId} to ${copiedSession.id} in ${repo.topLevel}.\n`)
+        break
+    }
+  } finally {
+    client.close()
+  }
+}
+
+const sessionLabel = (session) => {
+  const raw = typeof session.name === "string" && session.name.trim()
+    ? session.name.trim()
+    : typeof session.preview === "string" && session.preview.trim()
+      ? session.preview.trim()
+      : "Untitled session"
+  const normalized = raw.replaceAll(/\s+/g, " ")
+  return normalized.length <= 72 ? normalized : `${normalized.slice(0, 71)}…`
+}
+
+const workspaceTabTitle = (workspace, launches) =>
+  `${path.basename(workspace)}${workspaceTabTitleSuffix(launches)}`
+
+const workspaceTabTitleSuffix = (launches) => {
+  return `  ${loadingFrames[0]}${launches.length}`
+}
+
+const currentCodexSession = async (repo) => {
+  const sessions = await listSessions(repo.topLevel)
+  const callerThreadId = process.env.CODEX_THREAD_ID
+  const sourceProcessTty = processTty(process.pid)
+  return sessions.find((session) => sessionProcessIds(session)
+    .some((pid) => processTty(pid) === sourceProcessTty))
+    ?? sessions.find((session) => session.id === callerThreadId)
+    ?? null
+}
+
+const forkCodexEditor = async (repo) => {
+  const sourceSession = await currentCodexSession(repo)
+  if (!sourceSession) {
+    fail("could not identify the current Codex session")
+  }
+  const sourceTty = currentGhosttyTty()
+  if (!sourceTty) {
+    fail("could not identify the current Ghostty pane")
+  }
+  const sourceLocation = ghosttyTerminalLocation(sourceTty)
+  if (!sourceLocation) {
+    fail("could not find the current Ghostty pane")
+  }
+  const layoutProvider = paneLayoutProvider(readConfig().paneLayout)
+  const layout = ghosttyTabLayout(sourceLocation.tabId)
+  const placement = layoutProvider.placements(layout)[0]
+
+  const forkSurfaceCommand = surfaceCommandForLaunch(
+    repo.topLevel,
+    forkLaunch(sourceSession),
+  )
+  const workspaceName = path.basename(repo.topLevel)
+  const currentTabLaunches = [
+    resumeLaunch(sourceSession),
+    ...Array.from({ length: layout.terminalIds.length }, freshLaunch),
+  ]
+  const currentTabTitle = workspaceTabTitle(
+    repo.topLevel,
+    currentTabLaunches,
+  )
+  const overflowTitleSuffix = workspaceTabTitleSuffix([forkLaunch(sourceSession)])
+  const forkPrefillAction = ghosttyTextAction(defaultForkMessage)
+  const createOverflowTab = [
+    "if (count of tabs of candidateWindow) > 0 then",
+    "set lastExistingTab to last tab of candidateWindow",
+    "select tab lastExistingTab",
+    "end if",
+    "set forkTab to new tab in candidateWindow with configuration forkConfig",
+    "set forkTerminal to focused terminal of forkTab",
+    `perform action ${appleScriptQuote(`set_tab_title:${workspaceName}${overflowTitleSuffix}`)} on forkTerminal`,
+  ]
+  const placementScript = (() => {
+    if (!placement) {
+      return createOverflowTab
+    }
+    if (placement.target.case !== "existing") {
+      fail("the next fork placement must target an existing pane")
+    }
+    return [
+      "set splitTarget to missing value",
+      "repeat with candidateTerminal in terminals of candidateTab",
+      `if id of candidateTerminal is ${appleScriptQuote(placement.target.terminalId)} then set splitTarget to candidateTerminal`,
+      "end repeat",
+      "if splitTarget is missing value then error \"the planned fork target no longer exists\"",
+      `set forkTerminal to split splitTarget direction ${placement.direction} with configuration forkConfig`,
+      `perform action ${appleScriptQuote(`set_tab_title:${currentTabTitle}`)} on forkTerminal`,
+    ]
+  })()
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "set sourceTerminal to missing value",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if tty of candidateTerminal is ${appleScriptQuote(sourceTty)} then set sourceTerminal to candidateTerminal`,
+    "end repeat",
+    "if sourceTerminal is not missing value then",
+    `set forkConfig to new surface configuration from {initial working directory:${appleScriptQuote(repo.topLevel)}, command:${appleScriptQuote(forkSurfaceCommand)}}`,
+    "set forkTab to candidateTab",
+    ...placementScript,
+    "select tab forkTab",
+    "focus forkTerminal",
+    "activate window candidateWindow",
+    "set codexReady to false",
+    "repeat 100 times",
+    "try",
+    `if name of forkTerminal contains ${appleScriptQuote(workspaceName)} then`,
+    "set codexReady to true",
+    "exit repeat",
+    "end if",
+    "end try",
+    "delay 0.05",
+    "end repeat",
+    "if codexReady then",
+    "delay 0.3",
+    `perform action ${appleScriptQuote(forkPrefillAction)} on forkTerminal`,
+    "end if",
+    "return tty of forkTerminal",
+    "end if",
+    "set sourceTerminal to missing value",
+    "end repeat",
+    "end repeat",
+    "error \"the source Ghostty pane could not be found\"",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not fork the Codex session into a Ghostty pane")
+  }
+  ensureTitleDaemon()
+}
+
+const openFreshCodexTab = async (repo) => {
+  const sourceTty = currentGhosttyTty()
+  if (!sourceTty) {
+    fail("could not identify the current Ghostty pane")
+  }
+  const sourceLocation = ghosttyTerminalLocation(sourceTty)
+  if (!sourceLocation) {
+    fail("could not find the current Ghostty pane")
+  }
+  const layoutProvider = paneLayoutProvider(readConfig().paneLayout)
+  const layout = ghosttyTabLayout(sourceLocation.tabId)
+  const placement = layoutProvider.placements(layout)[0]
+
+  const surfaceCommand = surfaceCommandForLaunch(repo.topLevel, freshLaunch())
+  const workspaceName = path.basename(repo.topLevel)
+  const currentTabLaunches = Array.from(
+    { length: layout.terminalIds.length + 1 },
+    freshLaunch,
+  )
+  const currentTabTitle = workspaceTabTitle(
+    repo.topLevel,
+    currentTabLaunches,
+  )
+  const overflowTitleSuffix = workspaceTabTitleSuffix([freshLaunch()])
+  const createOverflowTab = [
+    "if (count of tabs of candidateWindow) > 0 then select tab last tab of candidateWindow",
+    "set sessionTab to new tab in candidateWindow with configuration sessionConfig",
+    "set sessionTerminal to focused terminal of sessionTab",
+    `perform action ${appleScriptQuote(`set_tab_title:${workspaceName}${overflowTitleSuffix}`)} on sessionTerminal`,
+  ]
+  const placementScript = (() => {
+    if (!placement) {
+      return createOverflowTab
+    }
+    if (placement.target.case !== "existing") {
+      fail("the next new-session placement must target an existing pane")
+    }
+    return [
+      "set splitTarget to missing value",
+      "repeat with candidateTerminal in terminals of candidateTab",
+      `if id of candidateTerminal is ${appleScriptQuote(placement.target.terminalId)} then set splitTarget to candidateTerminal`,
+      "end repeat",
+      'if splitTarget is missing value then error "the planned new-session target no longer exists"',
+      `set sessionTerminal to split splitTarget direction ${placement.direction} with configuration sessionConfig`,
+      `perform action ${appleScriptQuote(`set_tab_title:${currentTabTitle}`)} on sessionTerminal`,
+    ]
+  })()
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if tty of candidateTerminal is ${appleScriptQuote(sourceTty)} then`,
+    `set sessionConfig to new surface configuration from {initial working directory:${appleScriptQuote(repo.topLevel)}, command:${appleScriptQuote(surfaceCommand)}}`,
+    "set sessionTab to candidateTab",
+    ...placementScript,
+    "select tab sessionTab",
+    "focus sessionTerminal",
+    "activate window candidateWindow",
+    "return tty of sessionTerminal",
+    "end if",
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    'error "the source Ghostty pane could not be found"',
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not open a fresh Codex tab")
+  }
+  ensureTitleDaemon()
+}
+
+const launchCodexSessions = (
+  workspace,
+  launches,
+  dryRun,
+  openMode,
+  paneLayout,
+  sessionBackend = readConfig().sessionBackend,
+) => {
+  if (launches.length === 0) {
+    fail("at least one Codex session is required")
+  }
+
+  const layoutProvider = paneLayoutProvider(paneLayout)
+  const panesPerTab = layoutProvider.capacity
+  if (dryRun) {
+    const tabCount = Math.ceil(launches.length / panesPerTab)
+    const destination = openMode === "window"
+      ? "in one new Ghostty window"
+      : "as new tabs in the current/front Ghostty window"
+    process.stdout.write(`[dry-run] would open ${launches.length} Codex pane${launches.length === 1 ? "" : "s"} in ${paneLayout} layout across ${tabCount} named tab${tabCount === 1 ? "" : "s"} ${destination} for ${workspace}\n`)
+    return
+  }
+
+  const commands = launches.map((launch) =>
+    surfaceCommandForLaunch(workspace, launch, sessionBackend))
+
+  const surfaceConfiguration = (command) =>
+    `set sessionConfig to new surface configuration from {initial working directory:${appleScriptQuote(workspace)}, command:${appleScriptQuote(command)}}`
+
+  const tabScripts = []
+  for (let start = 0; start < commands.length; start += panesPerTab) {
+    const tabCommands = commands.slice(start, start + panesPerTab)
+    const tabLaunches = launches.slice(start, start + panesPerTab)
+    const tabTitleSuffix = workspaceTabTitleSuffix(tabLaunches)
+    const tabScript = [surfaceConfiguration(tabCommands[0])]
+
+    if (start === 0) {
+      switch (openMode) {
+        case "window":
+          tabScript.push(
+            "set workspaceWindow to new window with configuration sessionConfig",
+            "set workspaceTab to selected tab of workspaceWindow",
+          )
+          break
+        case "tabs":
+          tabScript.push(
+            "if (count of windows) > 0 then",
+            "set workspaceWindow to front window",
+            "if (count of tabs of workspaceWindow) > 0 then",
+            "set lastExistingTab to last tab of workspaceWindow",
+            "select tab lastExistingTab",
+            "end if",
+            "set workspaceTab to new tab in workspaceWindow with configuration sessionConfig",
+            "else",
+            "set workspaceWindow to new window with configuration sessionConfig",
+            "set workspaceTab to selected tab of workspaceWindow",
+            "end if",
+          )
+          break
+      }
+    } else {
+      tabScript.push("set workspaceTab to new tab in workspaceWindow with configuration sessionConfig")
+    }
+
+    tabScript.push(
+      "select tab workspaceTab",
+      "set topLeft to focused terminal of workspaceTab",
+      "set newestTerminal to topLeft",
+    )
+
+    const placements = layoutProvider.placements(singlePaneLayout("initial"))
+    for (let index = 1; index < tabCommands.length; index += 1) {
+      const placement = placements[index - 1]
+      if (!placement) {
+        fail(`${paneLayout} did not provide enough placements for ${tabCommands.length} panes`)
+      }
+      const splitTarget = (() => {
+        switch (placement.target.case) {
+          case "existing":
+            if (placement.target.terminalId !== "initial") {
+              fail(`${paneLayout} returned an unknown initial pane target`)
+            }
+            return "topLeft"
+          case "created":
+            return `createdPane${placement.target.index}`
+        }
+      })()
+      tabScript.push(
+        surfaceConfiguration(tabCommands[index]),
+        `set createdPane${index - 1} to split ${splitTarget} direction ${placement.direction} with configuration sessionConfig`,
+        `set newestTerminal to createdPane${index - 1}`,
+      )
+    }
+
+    tabScript.push(
+      `perform action ${appleScriptQuote(`set_tab_title:${path.basename(workspace)}${tabTitleSuffix}`)} on topLeft`,
+      "set newestTab to workspaceTab",
+    )
+    tabScripts.push(...tabScript)
+  }
+
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    ...tabScripts,
+    "select tab newestTab",
+    "focus newestTerminal",
+    "activate window workspaceWindow",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+
+  const ghosttyStatus = run("osascript", ["-e", 'application "Ghostty" is running'], {
+    allowFailure: true,
+  })
+  const ghosttyRunning = ghosttyStatus.status === 0 && ghosttyStatus.stdout.trim() === "true"
+  if (!ghosttyRunning) {
+    run("open", [
+      "-ga",
+      "Ghostty.app",
+      "--args",
+      "--initial-window=false",
+      "--window-save-state=never",
+    ])
+  }
+
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not create Ghostty tabs; restart Ghostty and try again")
+  }
+  ensureTitleDaemon()
+}
+
+const launchCodexSessionsAroundAnchor = (
+  workspace,
+  anchorTerminalId,
+  layout,
+  launches,
+  paneLayout,
+  sessionBackend = readConfig().sessionBackend,
+) => {
+  const commands = launches.map((launch) =>
+    surfaceCommandForLaunch(workspace, launch, sessionBackend))
+  const surfaceConfiguration = (command) =>
+    `set sessionConfig to new surface configuration from {initial working directory:${appleScriptQuote(workspace)}, command:${appleScriptQuote(command)}}`
+  const layoutProvider = paneLayoutProvider(paneLayout)
+  const panesPerTab = layoutProvider.capacity
+  const placements = layoutProvider.placements(layout)
+  const anchorCommands = commands.slice(0, placements.length)
+  const remainingCommands = commands.slice(anchorCommands.length)
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "set anchorTerminal to missing value",
+    "set workspaceTab to missing value",
+    "set workspaceWindow to missing value",
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    "repeat with candidateTerminal in terminals of candidateTab",
+    `if id of candidateTerminal is ${appleScriptQuote(anchorTerminalId)} then`,
+    "set anchorTerminal to candidateTerminal",
+    "set workspaceTab to candidateTab",
+    "set workspaceWindow to candidateWindow",
+    "end if",
+    "end repeat",
+    "end repeat",
+    "end repeat",
+    "if anchorTerminal is missing value then error \"the repair anchor pane no longer exists\"",
+    "select tab workspaceTab",
+    "set topLeft to anchorTerminal",
+    "set newestTerminal to topLeft",
+  ]
+
+  for (const [index, command] of anchorCommands.entries()) {
+    const placement = placements[index]
+    script.push(surfaceConfiguration(command))
+    switch (placement.target.case) {
+      case "existing":
+        script.push(
+          "set splitTarget to missing value",
+          "repeat with candidateTerminal in terminals of workspaceTab",
+          `if id of candidateTerminal is ${appleScriptQuote(placement.target.terminalId)} then set splitTarget to candidateTerminal`,
+          "end repeat",
+          "if splitTarget is missing value then error \"a pane moved while repair was running\"",
+        )
+        break
+      case "created":
+        script.push(`set splitTarget to createdPane${placement.target.index}`)
+        break
+    }
+    script.push(
+      `set createdPane${index} to split splitTarget direction ${placement.direction} with configuration sessionConfig`,
+      `set newestTerminal to createdPane${index}`,
+    )
+  }
+
+  for (let start = 0; start < remainingCommands.length; start += panesPerTab) {
+    const tabCommands = remainingCommands.slice(start, start + panesPerTab)
+    const tabLaunches = launches.slice(
+      anchorCommands.length + start,
+      anchorCommands.length + start + panesPerTab,
+    )
+    const tabTitleSuffix = workspaceTabTitleSuffix(tabLaunches)
+    script.push(
+      surfaceConfiguration(tabCommands[0]),
+      "if (count of tabs of workspaceWindow) > 0 then select tab last tab of workspaceWindow",
+      "set workspaceTab to new tab in workspaceWindow with configuration sessionConfig",
+      "select tab workspaceTab",
+      "set topLeft to focused terminal of workspaceTab",
+      "set newestTerminal to topLeft",
+    )
+    const tabPlacements = layoutProvider.placements(singlePaneLayout("initial"))
+    for (let index = 1; index < tabCommands.length; index += 1) {
+      const placement = tabPlacements[index - 1]
+      if (!placement) {
+        fail(`${paneLayout} did not provide enough overflow placements`)
+      }
+      const splitTarget = (() => {
+        switch (placement.target.case) {
+          case "existing":
+            if (placement.target.terminalId !== "initial") {
+              fail(`${paneLayout} returned an unknown overflow pane target`)
+            }
+            return "topLeft"
+          case "created":
+            return `overflowPane${placement.target.index}`
+        }
+      })()
+      script.push(
+        surfaceConfiguration(tabCommands[index]),
+        `set overflowPane${index - 1} to split ${splitTarget} direction ${placement.direction} with configuration sessionConfig`,
+        `set newestTerminal to overflowPane${index - 1}`,
+      )
+    }
+    script.push(
+      `perform action ${appleScriptQuote(`set_tab_title:${path.basename(workspace)}${tabTitleSuffix}`)} on topLeft`,
+    )
+  }
+
+  script.push(
+    "select tab workspaceTab",
+    "focus newestTerminal",
+    "activate window workspaceWindow",
+    "end tell",
+    "end using terms from",
+  )
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script.join("\n"),
+  })
+  if (result.error || result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not rebuild the Codex sessions around the anchor pane")
+  }
+}
+
+const repairWorkspace = async (workspace, options) => {
+  if (!options.dry_run) {
+    ensureTitleDaemon()
+  }
+  const sessions = await listSessions(workspace)
+  const orderedSessions = sessionsInStableOrder(sessions)
+  const runners = tmuxRunnersForWorkspace(workspace)
+  const allActiveTerminals = orderedSessions.flatMap((session) =>
+    [...new Set((tmuxRunnerForSession(session, runners)?.clientTtys
+      ?? sessionProcessIds(session)
+        .map(processTty)
+        .filter((tty) => tty !== null)))]
+      .map((tty) => ({
+        location: ghosttyTerminalLocation(tty),
+        session,
+        tty,
+      })))
+    .filter((entry) => entry.location !== null)
+  const activeTerminals = typeof options.target_tab_id === "string"
+    ? allActiveTerminals.filter((entry) => entry.location.tabId === options.target_tab_id)
+    : allActiveTerminals
+  const callerTty = currentGhosttyTty()
+  const callerLocation = callerTty === null
+    ? null
+    : ghosttyTerminalLocation(callerTty)
+  const callerSessionAnchor = typeof process.env.CODEX_THREAD_ID === "string"
+    ? activeTerminals.find((entry) => entry.session.id === process.env.CODEX_THREAD_ID)
+    : undefined
+  const preferredAnchor = callerSessionAnchor ?? activeTerminals.find((entry) =>
+    callerLocation !== null
+      && entry.location.windowId === callerLocation.windowId
+      && entry.location.tabId === callerLocation.tabId)
+    ?? activeTerminals[0]
+
+  if (!preferredAnchor) {
+    if (options.dry_run) {
+      process.stdout.write(`[dry-run] no active anchor; would open ${sessions.length || 1} session${sessions.length === 1 ? "" : "s"} using ${options.open_mode} mode\n`)
+    }
+    launchCodexSessions(
+      workspace,
+      sessions.length === 0
+        ? [freshLaunch()]
+        : orderedSessions.map(resumeLaunch),
+      Boolean(options.dry_run),
+      options.open_mode,
+      options.pane_layout,
+      options.session_backend,
+    )
+    return
+  }
+
+  const layout = ghosttyTabLayout(preferredAnchor.location.tabId)
+  const anchorTabTerminals = activeTerminals.filter((entry) =>
+    entry.location.tabId === preferredAnchor.location.tabId)
+  const anchorTabWorkspaceTerminalIds = anchorTabTerminals
+    .map((entry) => entry.location.terminalId)
+  const anchorTabWorkspaceTerminalIdSet = new Set(anchorTabWorkspaceTerminalIds)
+  const unrelatedPaneCount = layout.terminalIds.filter((terminalId) =>
+    !anchorTabWorkspaceTerminalIdSet.has(terminalId)).length
+  const layoutProvider = paneLayoutProvider(options.pane_layout)
+  const compatible = layoutProvider.isCompatible(layout)
+  const activeSessionIds = new Set(allActiveTerminals.map((entry) => entry.session.id))
+  const missingSessions = orderedSessions.filter((session) => !activeSessionIds.has(session.id))
+  const canCompleteWithoutMoving = layoutProvider.canCompleteWithoutMoving(
+    layout,
+    missingSessions.length,
+  )
+  let anchor = preferredAnchor
+  let terminalsToRestart = []
+  let sessionsToResume = missingSessions
+  let launchLayout = layout
+
+  if (!compatible && !canCompleteWithoutMoving && unrelatedPaneCount === 0) {
+    const stableAnchorTerminalId = topLeftTerminalId(layout, anchorTabWorkspaceTerminalIds)
+    const stableAnchor = anchorTabTerminals.find((entry) =>
+      entry.location.terminalId === stableAnchorTerminalId)
+    if (!stableAnchor) {
+      fail("could not identify the stable top-left Codex pane")
+    }
+    anchor = stableAnchor
+    terminalsToRestart = anchorTabTerminals.filter((entry) =>
+      entry.location.terminalId !== anchor.location.terminalId)
+    const terminalsById = new Map(anchorTabTerminals.map((entry) =>
+      [entry.location.terminalId, entry]))
+    const restartedSessions = spatialTerminalOrder(layout, anchorTabWorkspaceTerminalIds)
+      .filter((terminalId) => terminalId !== anchor.location.terminalId)
+      .map((terminalId) => terminalsById.get(terminalId)?.session)
+      .filter((session) => session !== undefined)
+      .filter((session, index, values) =>
+        values.findIndex((candidate) => candidate.id === session.id) === index)
+    sessionsToResume = [...restartedSessions, ...missingSessions]
+    launchLayout = singlePaneLayout(anchor.location.terminalId)
+  }
+
+  if (options.dry_run) {
+    if (compatible) {
+      process.stdout.write(`[dry-run] layout already matches ${options.pane_layout}; would keep ${activeTerminals.length} active Codex pane${activeTerminals.length === 1 ? "" : "s"}${unrelatedPaneCount === 0 ? "" : ` and ${unrelatedPaneCount} unrelated pane${unrelatedPaneCount === 1 ? "" : "s"}`} in place and open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"}\n`)
+      return
+    }
+    if (canCompleteWithoutMoving) {
+      process.stdout.write(`[dry-run] would keep the stacked Codex panes in place and fill the open right side with ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"}\n`)
+      return
+    }
+    if (unrelatedPaneCount > 0) {
+      process.stdout.write(`[dry-run] would keep the mixed pane layout unchanged and open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"} in new tabs\n`)
+      return
+    }
+    process.stdout.write(`[dry-run] would keep ${anchor.session.id} in the top-left position, restart ${terminalsToRestart.length} misplaced pane${terminalsToRestart.length === 1 ? "" : "s"}, and open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"}\n`)
+    return
+  }
+
+  if (compatible && sessionsToResume.length === 0) {
+    process.stdout.write(`Layout already matches ${options.pane_layout}; kept ${activeTerminals.length} Codex pane${activeTerminals.length === 1 ? "" : "s"}${unrelatedPaneCount === 0 ? "" : ` and ${unrelatedPaneCount} unrelated pane${unrelatedPaneCount === 1 ? "" : "s"}`} unchanged.\n`)
+    return
+  }
+
+  if (!compatible && unrelatedPaneCount > 0 && sessionsToResume.length === 0) {
+    process.stdout.write(`Kept the mixed pane layout unchanged; no sessions were missing.\n`)
+    return
+  }
+
+  if (terminalsToRestart.length > 0) {
+    process.stdout.write(`Keeping ${sessionLabel(anchor.session)} in the top-left position and repositioning ${terminalsToRestart.length} Codex pane${terminalsToRestart.length === 1 ? "" : "s"}...\n`)
+    for (const terminal of terminalsToRestart) {
+      await forceCloseGhosttyTerminal(terminal.tty, terminal.location.terminalId)
+    }
+  } else if (unrelatedPaneCount > 0) {
+    process.stdout.write(`Keeping the current mixed layout and opening ${sessionsToResume.length} missing session${sessionsToResume.length === 1 ? "" : "s"} without moving existing panes...\n`)
+  } else {
+    process.stdout.write(`Keeping ${activeTerminals.length} Codex pane${activeTerminals.length === 1 ? "" : "s"} in place and opening ${sessionsToResume.length} missing session${sessionsToResume.length === 1 ? "" : "s"}...\n`)
+  }
+
+  launchCodexSessionsAroundAnchor(
+    workspace,
+    anchor.location.terminalId,
+    launchLayout,
+    sessionsToResume.map(resumeLaunch),
+    options.pane_layout,
+    options.session_backend,
+  )
+}
+
+const repairAllTabsInCurrentWindow = async (options) => {
+  const callerTty = currentGhosttyTty()
+  const callerLocation = callerTty === null
+    ? null
+    : ghosttyTerminalLocation(callerTty)
+  if (!callerLocation) {
+    fail("repair --all must be run from a Ghostty window")
+  }
+
+  const runnersByClientTty = new Map()
+  for (const runner of listTmuxRunners()) {
+    for (const tty of runner.clientTtys) {
+      runnersByClientTty.set(tty, runner)
+    }
+  }
+  const targets = ghosttyTabSnapshots()
+    .filter((tab) => tab.windowId === callerLocation.windowId)
+    .sort((left, right) => left.tabIndex - right.tabIndex)
+    .flatMap((tab) => [...new Set(tab.terminalTtys
+      .map((tty) => runnersByClientTty.get(tty)?.workspace)
+      .filter((workspace) => typeof workspace === "string"))]
+      .map((workspace) => ({
+        tabId: tab.tabId,
+        tabIndex: tab.tabIndex,
+        workspace,
+      })))
+
+  if (targets.length === 0) {
+    process.stdout.write("No workspace tabs found in this Ghostty window.\n")
+    return
+  }
+
+  process.stdout.write(`Repairing ${targets.length} workspace tab${targets.length === 1 ? "" : "s"} in this Ghostty window...\n`)
+  for (const target of targets) {
+    process.stdout.write(`\n${path.basename(target.workspace)} · tab #${target.tabIndex}\n`)
+    await repairWorkspace(target.workspace, {
+      ...options,
+      target_tab_id: target.tabId,
+    })
+  }
+}
+
+const printSessions = (sessions) => {
+  if (sessions.length === 0) {
+    process.stdout.write("No non-archived sessions.\n")
+    return
+  }
+
+  const runners = listTmuxRunners()
+  for (const session of sessions) {
+    const updated = new Date(session.updatedAt * 1000).toLocaleString()
+    const runner = tmuxRunnerForSession(session, runners)
+    const state = runner
+      ? runner.clientTtys.length > 0 ? "open" : "detached"
+      : sessionIsOpen(session) ? "direct" : "idle"
+    process.stdout.write(`${session.id}  ${state.padEnd(8)}  ${updated}  ${sessionLabel(session)}\n`)
+  }
+}
+
+const openWorkspace = async (workspace, options) => {
+  if (!options.dry_run) {
+    ensureTitleDaemon()
+  }
+  if (options.fresh) {
+    process.stdout.write(`Opening a fresh Codex session in ${workspace}\n`)
+    launchCodexSessions(
+      workspace,
+      [freshLaunch()],
+      options.dry_run,
+      options.open_mode,
+      options.pane_layout,
+      options.session_backend,
+    )
+    return
+  }
+
+  process.stdout.write(`Finding non-archived Codex sessions in ${workspace}...\n`)
+  const sessions = await listSessions(workspace)
+  const ghosttyTtys = ghosttyTerminalTtys()
+  const runners = tmuxRunnersForWorkspace(workspace)
+  const matchedRunnerNames = new Set()
+  const classified = sessions.map((session) => {
+    const processIds = sessionProcessIds(session)
+    const processTtys = [...new Set(processIds.map(processTty).filter((tty) => tty !== null))]
+    const runner = tmuxRunnerForSession(session, runners)
+    if (runner) {
+      matchedRunnerNames.add(runner.name)
+    }
+    const visibleTtys = runner ? runner.clientTtys : processTtys
+    const visible = ghosttyTtys !== null
+      && visibleTtys.some((tty) => ghosttyTtys.has(tty))
+    const tmuxDetached = runner !== null
+      && processIds.length > 0
+      && runner.clientTtys.length === 0
+    const legacyDetached = runner === null
+      && processIds.length > 0
+      && ghosttyTtys !== null
+      && !visible
+      && processIds.every(processHasGhosttyAncestor)
+    return {
+      legacyDetached,
+      processIds,
+      processTtys,
+      runner,
+      session,
+      tmuxDetached,
+      visible,
+    }
+  })
+  const pendingRunners = runners.filter((runner) =>
+    !matchedRunnerNames.has(runner.name) && runner.threadId === null)
+  const pendingDetached = pendingRunners.filter((runner) => runner.clientTtys.length === 0)
+  const pendingVisible = pendingRunners.filter((runner) => runner.clientTtys.length > 0)
+  const legacyDetached = classified.filter((entry) => entry.legacyDetached)
+  const active = classified.filter((entry) =>
+    entry.processIds.length > 0
+      && !entry.legacyDetached
+      && !entry.tmuxDetached
+      && entry.visible)
+  const resumable = classified.filter((entry) =>
+    entry.processIds.length === 0
+      || entry.legacyDetached
+      || entry.tmuxDetached)
+
+  if (legacyDetached.length > 0) {
+    process.stdout.write(`${options.dry_run ? "Would reclaim" : "Reclaiming"} ${legacyDetached.length} legacy detached Codex session${legacyDetached.length === 1 ? "" : "s"} whose Ghostty pane no longer exists.\n`)
+    if (!options.dry_run) {
+      terminateDetachedTtys(legacyDetached.flatMap((entry) => entry.processTtys))
+    }
+  }
+
+  const launches = [
+    ...sessionsInStableOrder(resumable.map((entry) => entry.session)).map((session) => {
+      const entry = resumable.find((candidate) => candidate.session.id === session.id)
+      return entry?.runner && entry.tmuxDetached
+        ? attachLaunch(entry.runner, session)
+        : resumeLaunch(session)
+    }),
+    ...pendingDetached
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .map(attachLaunch),
+  ]
+
+  const activeCount = active.length + pendingVisible.length
+  if (activeCount > 0 && launches.length > 0) {
+    process.stdout.write(`Skipping ${activeCount} session${activeCount === 1 ? "" : "s"} already visible.\n`)
+  }
+
+  if (launches.length === 0) {
+    if (active.length > 0) {
+      if (options.dry_run) {
+        focusCodexSession(active[0].session, true)
+        return
+      }
+      const focused = focusCodexSession(active[0].session, false)
+      if (focused) {
+        process.stdout.write(`Focused ${sessionLabel(active[0].session)}.\n`)
+        if (options.session_backend === "tmux" && active[0].runner === null) {
+          process.stdout.write("This existing direct session will become persistent after it is next reopened.\n")
+        }
+      } else {
+        process.stdout.write("Every session is already open, but its Ghostty pane could not be found.\n")
+      }
+      return
+    }
+    if (pendingVisible.length > 0) {
+      if (options.dry_run) {
+        process.stdout.write("[dry-run] would focus the pending Codex session.\n")
+        return
+      }
+      const focused = focusGhosttyTtys(pendingVisible[0].clientTtys)
+      process.stdout.write(focused
+        ? "Focused the pending Codex session.\n"
+        : "The pending Codex session is attached, but its Ghostty pane could not be found.\n")
+      return
+    }
+    process.stdout.write("No sessions found; opening a fresh Codex session.\n")
+    launchCodexSessions(
+      workspace,
+      [freshLaunch()],
+      options.dry_run,
+      options.open_mode,
+      options.pane_layout,
+      options.session_backend,
+    )
+    return
+  }
+
+  const tabCount = Math.ceil(
+    launches.length / paneLayoutProvider(options.pane_layout).capacity,
+  )
+  process.stdout.write(`Opening ${launches.length} session${launches.length === 1 ? "" : "s"} in ${options.pane_layout} layout across ${tabCount} Ghostty tab${tabCount === 1 ? "" : "s"}:\n`)
+  for (const launch of launches) {
+    process.stdout.write(`  ${launch.case === "attach" ? "Detached Codex session" : sessionLabel(launch.session)}\n`)
+  }
+  launchCodexSessions(
+    workspace,
+    launches,
+    options.dry_run,
+    options.open_mode,
+    options.pane_layout,
+    options.session_backend,
+  )
+}
+
+const createWorkspace = async (repo, name, options) => {
+  validateName(name)
+  const workspace = managedWorkspacePath(repo, name)
+  const branch = `codex/${name}`
+  const base = options.base ?? "HEAD"
+
+  if (worktrees().some((worktree) => worktree.path === workspace) || existsSync(workspace)) {
+    fail(`workspace ${name} already exists; open it with: ${commandName} open ${name}`)
+  }
+
+  const branchExists = run("git", [
+    "show-ref",
+    "--verify",
+    "--quiet",
+    `refs/heads/${branch}`,
+  ], { allowFailure: true }).status === 0
+
+  const worktreeArguments = branchExists
+    ? ["worktree", "add", workspace, branch]
+    : ["worktree", "add", "-b", branch, workspace, base]
+
+  if (options.dry_run) {
+    process.stdout.write(`[dry-run] git ${worktreeArguments.map(shellQuote).join(" ")}\n`)
+    process.stdout.write(`[dry-run] would launch a fresh Codex session in ${workspace}\n`)
+    return
+  }
+
+  mkdirSync(path.dirname(workspace), { recursive: true })
+  run("git", worktreeArguments, { inherit: true })
+  process.stdout.write(`Created ${workspace} on ${branch}.\n`)
+  process.stdout.write("Uncommitted changes from the source checkout were not copied.\n")
+
+  if (!options.no_open) {
+    launchCodexSessions(
+      workspace,
+      [freshLaunch()],
+      false,
+      options.open_mode,
+      options.pane_layout,
+      options.session_backend,
+    )
+  }
+}
+
+const deleteWorkspace = async (repo, name, options) => {
+  validateName(name)
+  const workspace = resolveWorkspace(repo, name)
+  const branch = `codex/${name}`
+  const registered = worktrees().find((worktree) => worktree.path === workspace)
+  const checkedOutBranch = registered?.branch?.replace("refs/heads/", "") ?? null
+
+  if (!options.keep_branch && checkedOutBranch !== branch) {
+    fail(`workspace ${name} is on ${checkedOutBranch ?? "a detached HEAD"}; use --keep-branch to preserve it`)
+  }
+
+  if (!options.dry_run) {
+    const status = run("git", ["-C", workspace, "status", "--porcelain"]).stdout.trim()
+    if (status && !options.force) {
+      fail(`workspace ${name} has uncommitted changes; commit them or use --force`)
+    }
+  }
+
+  const sessions = await listSessions(workspace)
+  const workspaceRunners = tmuxRunnersForWorkspace(workspace)
+  if (!options.dry_run) {
+    if (!options.force) {
+      const runnerSessionIds = new Set(workspaceRunners
+        .map((runner) => runner.threadId)
+        .filter((threadId) => threadId !== null))
+      const activeDirectSessions = sessions.filter((session) =>
+        sessionIsOpen(session) && !runnerSessionIds.has(session.id))
+      const activeCount = workspaceRunners.length + activeDirectSessions.length
+      if (activeCount > 0) {
+        fail(`workspace ${name} has ${activeCount} open Codex session${activeCount === 1 ? "" : "s"}; close them or use --force`)
+      }
+    }
+  }
+
+  const removeArguments = ["worktree", "remove"]
+  if (options.force) {
+    removeArguments.push("--force")
+  }
+  removeArguments.push(workspace)
+
+  if (options.dry_run) {
+    process.stdout.write(`[dry-run] would archive ${sessions.length} Codex session${sessions.length === 1 ? "" : "s"}\n`)
+    if (workspaceRunners.length > 0) {
+      process.stdout.write(`[dry-run] would stop ${workspaceRunners.length} persistent tmux runner${workspaceRunners.length === 1 ? "" : "s"}\n`)
+    }
+    process.stdout.write(`[dry-run] git ${removeArguments.map(shellQuote).join(" ")}\n`)
+    if (!options.keep_branch) {
+      process.stdout.write(`[dry-run] git branch -D ${shellQuote(branch)}\n`)
+    }
+    return
+  }
+
+  await archiveSessions(sessions)
+  if (sessions.length > 0) {
+    process.stdout.write(`Archived ${sessions.length} Codex session${sessions.length === 1 ? "" : "s"}.\n`)
+  }
+
+  for (const runner of workspaceRunners) {
+    const terminals = runner.clientTtys.flatMap((tty) => {
+      const terminalId = ghosttyTerminalId(tty)
+      return terminalId ? [{ terminalId, tty }] : []
+    })
+    killTmuxRunner(runner.name)
+    await waitMilliseconds(50)
+    for (const terminal of terminals) {
+      await forceCloseGhosttyTerminal(terminal.tty, terminal.terminalId)
+    }
+  }
+
+  run("git", removeArguments, { inherit: true })
+  process.stdout.write(`Deleted ${workspace}.\n`)
+  if (!options.keep_branch) {
+    run("git", ["branch", "-D", branch], { inherit: true })
+  } else {
+    process.stdout.write(`Kept branch ${branch}.\n`)
+  }
+}
+
+const relativeTime = (timestamp) => {
+  const elapsedSeconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp))
+  if (elapsedSeconds < 10) return "now"
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s ago`
+  if (elapsedSeconds < 60 * 60) return `${Math.floor(elapsedSeconds / 60)}m ago`
+  if (elapsedSeconds < 24 * 60 * 60) return `${Math.floor(elapsedSeconds / (60 * 60))}h ago`
+  if (elapsedSeconds < 365 * 24 * 60 * 60) return `${Math.floor(elapsedSeconds / (24 * 60 * 60))}d ago`
+  return `${Math.floor(elapsedSeconds / (365 * 24 * 60 * 60))}y ago`
+}
+
+const truncateText = (value, width) => {
+  if (width <= 0) return ""
+  const characters = [...value]
+  if (characters.length <= width) return value
+  if (width === 1) return "…"
+  return `${characters.slice(0, width - 1).join("")}…`
+}
+
+const padColumn = (value, width) => truncateText(value, width).padEnd(width)
+
+const terminalColumns = () => {
+  const configured = Number.parseInt(process.env.COLUMNS ?? "", 10)
+  const detected = process.stdout.columns ?? 0
+  return Math.max(40, detected > 0 ? detected : Number.isFinite(configured) ? configured : 120)
+}
+
+const ansi = (code, value) => process.stdout.isTTY && !process.env.NO_COLOR
+  ? `\u001b[${code}m${value}\u001b[0m`
+  : value
+
+const managedWorkspaceEntries = async (repo) => {
+  const canonicalWorkspaceDirectory = canonicalPath(repo.workspaceDirectory)
+  const prefix = `${canonicalWorkspaceDirectory}${path.sep}`
+  const managed = worktrees()
+    .filter((worktree) => worktree.path.startsWith(prefix))
+  const sessions = await listSessions(canonicalWorkspaceDirectory).catch(() => [])
+
+  return managed.map((workspace) => {
+    const name = path.relative(canonicalWorkspaceDirectory, workspace.path)
+    const workspaceSessions = sessions.filter((session) =>
+      pathContains(workspace.path, canonicalPath(session.cwd)))
+    const latestSession = workspaceSessions[0]
+    const workspaceStats = statSync(workspace.path)
+    const createdAt = Math.max(workspaceStats.birthtimeMs, workspaceStats.mtimeMs) / 1000
+    const status = run("git", ["-C", workspace.path, "status", "--porcelain"]).stdout.trim()
+    const changedFiles = status ? status.split("\n").length : 0
+    return {
+      activity: Math.max(createdAt, latestSession?.updatedAt ?? 0),
+      branch: workspace.branch?.replace("refs/heads/", "") ?? "detached HEAD",
+      changedFiles,
+      current: canonicalPath(repo.topLevel) === workspace.path,
+      dirty: changedFiles > 0,
+      latestSession: latestSession ? sessionLabel(latestSession) : "",
+      name,
+      path: workspace.path,
+      sessions: workspaceSessions,
+    }
+  }).sort((left, right) => right.activity - left.activity)
+}
+
+const renderWorkspaceList = (entries) => {
+  const columns = terminalColumns()
+  const nameWidth = Math.min(
+    Math.max("workspace".length, ...entries.map((entry) => entry.name.length)),
+    Math.max(12, Math.floor(columns * 0.24)),
+  )
+  const ageLabels = entries.map((entry) => relativeTime(entry.activity))
+  const ageWidth = Math.max("updated".length, ...ageLabels.map((label) => label.length))
+  const chatsWidth = Math.max("chats".length, ...entries.map((entry) => String(entry.sessions.length).length))
+  const fixedWidth = 2 + nameWidth + 2 + ageWidth + 2 + 5 + 2 + chatsWidth
+  const latestWidth = columns - fixedWidth - 2
+  const showLatest = latestWidth >= 12
+  const header = [
+    "  ",
+    padColumn("workspace", nameWidth),
+    "  ",
+    padColumn("updated", ageWidth),
+    "  ",
+    "git  ",
+    "  ",
+    padColumn("chats", chatsWidth),
+    ...(showLatest ? ["  ", padColumn("latest", latestWidth)] : []),
+  ].join("")
+  process.stdout.write(`${ansi("2", header.trimEnd())}\n`)
+
+  entries.forEach((entry, index) => {
+    const marker = entry.current ? ansi("36", "›") : " "
+    const name = entry.current ? ansi("1;36", padColumn(entry.name, nameWidth)) : padColumn(entry.name, nameWidth)
+    const age = ansi("2", padColumn(ageLabels[index], ageWidth))
+    const gitState = entry.dirty
+      ? ansi("33", padColumn("dirty", 5))
+      : padColumn("", 5)
+    const fields = [
+      marker,
+      " ",
+      name,
+      "  ",
+      age,
+      "  ",
+      gitState,
+      "  ",
+      String(entry.sessions.length).padEnd(chatsWidth),
+    ]
+    if (showLatest) {
+      fields.push("  ", truncateText(entry.latestSession, latestWidth))
+    }
+    process.stdout.write(`${fields.join("").trimEnd()}\n`)
+  })
+}
+
+const pickerPreview = (entry) => {
+  const displayPath = entry.path.startsWith(`${homedir()}${path.sep}`)
+    ? `~${entry.path.slice(homedir().length)}`
+    : entry.path
+  const gitSummary = entry.dirty
+    ? `dirty · ${entry.changedFiles} changed file${entry.changedFiles === 1 ? "" : "s"}`
+    : "clean"
+  const chatLines = entry.sessions.length === 0
+    ? ["  No chats yet"]
+    : entry.sessions.map((session) =>
+      `  ${relativeTime(session.updatedAt).padEnd(8)} ${sessionLabel(session)}`)
+  return [
+    entry.name,
+    displayPath,
+    "",
+    `${entry.branch}${entry.current ? " · current workspace" : ""}`,
+    `${gitSummary} · updated ${relativeTime(entry.activity)}`,
+    "",
+    `Chats (${entry.sessions.length})`,
+    ...chatLines,
+    "",
+  ].join("\n")
+}
+
+const pickWorkspace = async (repo) => {
+  const entries = await managedWorkspaceEntries(repo)
+  if (entries.length === 0) {
+    process.stdout.write(`No ${commandName} worktrees for ${repo.name}.\n`)
+    return
+  }
+
+  const fzf = commandPath("fzf")
+  if (!process.stdin.isTTY || !process.stdout.isTTY || !fzf) {
+    renderWorkspaceList(entries)
+    return
+  }
+
+  const nameWidth = Math.min(Math.max(...entries.map((entry) => entry.name.length)), 12)
+  const previewDirectory = mkdtempSync(path.join(tmpdir(), "ws-picker-"))
+  try {
+    const input = entries.map((entry, index) => {
+      writeFileSync(path.join(previewDirectory, String(index)), pickerPreview(entry))
+      const marker = entry.current ? "●" : " "
+      const dirty = entry.dirty ? "dirty" : ""
+      const age = relativeTime(entry.activity).replace(" ago", "")
+      const display = `${marker} ${padColumn(entry.name, nameWidth)} ${age.padEnd(4)} ${dirty.padEnd(5)} ${entry.sessions.length}`
+      return `${index}\t${display.trimEnd()}`
+    }).join("\n")
+    const previewCommand = `/bin/cat ${shellQuote(previewDirectory)}/{1}`
+    const result = spawnSync(fzf, [
+      "--ansi",
+      "--no-sort",
+      "--cycle",
+      "--delimiter=\t",
+      "--with-nth=2..",
+      "--height=90%",
+      "--min-height=15+",
+      "--layout=reverse",
+      "--border=rounded",
+      "--padding=1,1",
+      "--prompt=workspace › ",
+      "--pointer=›",
+      "--info=inline-right",
+      "--header=enter open · esc close",
+      "--preview-label= details ",
+      "--preview-window=right,50%,wrap",
+      `--preview=${previewCommand}`,
+    ], {
+      encoding: "utf8",
+      input: `${input}\n`,
+      stdio: ["pipe", "pipe", "inherit"],
+    })
+    if (result.error) {
+      fail(`fzf failed: ${result.error.message}`)
+    }
+    if (result.status === 1 || result.status === 130) {
+      return
+    }
+    if (result.status !== 0) {
+      fail(`fzf exited with status ${result.status}`)
+    }
+    const selectedIndex = Number.parseInt(result.stdout.split("\t", 1)[0], 10)
+    const selected = entries[selectedIndex]
+    if (!selected) {
+      fail("fzf returned an invalid workspace selection")
+    }
+    await openWorkspace(selected.path, {
+      ...resolveLaunchSettings({}),
+      dry_run: false,
+      fresh: false,
+    })
+  } finally {
+    rmSync(previewDirectory, { force: true, recursive: true })
+  }
+}
+
+const listManagedWorkspaces = async (repo, options) => {
+  const entries = await managedWorkspaceEntries(repo)
+
+  if (entries.length === 0) {
+    process.stdout.write(`No ${commandName} worktrees for ${repo.name}.\n`)
+    return
+  }
+
+  if (options.names_only) {
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      process.stdout.write(`${entry.name}\n`)
+    }
+    return
+  }
+
+  renderWorkspaceList(entries)
+}
+
+const main = async () => {
+  const [command, ...values] = process.argv.slice(2)
+
+  if (!command) {
+    await pickWorkspace(repository())
+    return
+  }
+
+  if (command === "help" || command === "--help" || command === "-h") {
+    usage()
+    return
+  }
+
+  if (command === "config" || command === "cfg") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length > 0) {
+      fail("config does not accept arguments")
+    }
+    editConfig()
+    return
+  }
+
+  if (command === "close-tty") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 2) {
+      fail("close-tty requires a TTY and terminal ID")
+    }
+    await forceCloseGhosttyTerminal(positional[0], positional[1])
+    return
+  }
+
+  if (command === "close-runner") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 3) {
+      fail("close-runner requires a tmux runner, TTY, and terminal ID")
+    }
+    killTmuxRunner(positional[0])
+    await waitMilliseconds(50)
+    await forceCloseGhosttyTerminal(positional[1], positional[2])
+    return
+  }
+
+  if (command === "title-daemon") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length > 0) {
+      fail("title-daemon does not accept arguments")
+    }
+    await runTitleDaemon()
+    return
+  }
+
+  if (command === "ensure-title-daemon") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length > 0) {
+      fail("ensure-title-daemon does not accept arguments")
+    }
+    ensureTitleDaemon()
+    return
+  }
+
+  if (command === "toggle-attention") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 1) {
+      fail("toggle-attention requires a tmux runner name")
+    }
+    toggleRunnerAttention(positional[0])
+    return
+  }
+
+  if (command === "mark-attention") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 2 || !["read", "unread"].includes(positional[1])) {
+      fail("mark-attention requires a tmux runner name and read or unread")
+    }
+    setRunnerAttention(positional[0], positional[1])
+    return
+  }
+
+  const repo = repository()
+
+  switch (command) {
+    case "new":
+    case "ne": {
+      const { options, positional } = parseOptions(values, new Set([
+        "--base",
+        "--dry-run",
+        "--no-open",
+        "--tabs",
+        "--window",
+      ]))
+      if (positional.length !== 1) {
+        fail("new requires exactly one workspace name")
+      }
+      await createWorkspace(repo, positional[0], {
+        ...options,
+        ...resolveLaunchSettings(options),
+      })
+      return
+    }
+    case "open":
+    case "op": {
+      const { options, positional } = parseOptions(values, new Set([
+        "--dry-run",
+        "--fresh",
+        "--tabs",
+        "--window",
+      ]))
+      if (positional.length !== 1) {
+        fail("open requires exactly one workspace name or .")
+      }
+      await openWorkspace(resolveWorkspace(repo, positional[0]), {
+        ...options,
+        ...resolveLaunchSettings(options),
+      })
+      return
+    }
+    case "repair": {
+      const { options, positional } = parseOptions(values, new Set([
+        "--all",
+        "--dry-run",
+        "--tabs",
+        "--window",
+      ]))
+      if (positional.length > 0) {
+        fail("repair does not accept a workspace name; it repairs the current checkout")
+      }
+      const repairOptions = {
+        ...options,
+        ...resolveLaunchSettings(options),
+      }
+      if (options.all) {
+        await repairAllTabsInCurrentWindow(repairOptions)
+      } else {
+        await repairWorkspace(repo.topLevel, repairOptions)
+      }
+      return
+    }
+    case "remove":
+    case "rm":
+    case "delete": {
+      const { options, positional } = parseOptions(values, new Set([
+        "--dry-run",
+        "--force",
+        "--keep-branch",
+      ]))
+      if (positional.length !== 1) {
+        fail("remove requires exactly one workspace name")
+      }
+      await deleteWorkspace(repo, positional[0], options)
+      return
+    }
+    case "cp":
+    case "mv": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length !== 2 || positional[0] !== "session") {
+        fail(`${command} requires: ${commandName} ${command} session <session-id>`)
+      }
+      await transferSession(
+        repo,
+        positional[1],
+        command === "cp" ? "copy" : "move",
+      )
+      return
+    }
+    case "sessions": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length !== 1) {
+        fail("sessions requires exactly one workspace name or .")
+      }
+      const workspace = resolveWorkspace(repo, positional[0])
+      process.stdout.write(`Non-archived sessions in ${workspace}:\n`)
+      printSessions(await listSessions(workspace))
+      return
+    }
+    case "list":
+    case "ls": {
+      const { options, positional } = parseOptions(values, new Set(["--names-only"]))
+      if (positional.length > 0) {
+        fail("list does not accept positional arguments")
+      }
+      await listManagedWorkspaces(repo, options)
+      return
+    }
+    case "path": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length !== 1) {
+        fail("path requires exactly one workspace name or .")
+      }
+      process.stdout.write(`${resolveWorkspace(repo, positional[0])}\n`)
+      return
+    }
+    case "fork-editor": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length !== 1) {
+        fail("fork-editor requires the temporary editor file")
+      }
+      switch (resolveEditorIntent(repo, positional[0])) {
+        case "archive":
+          await archiveCurrentSession(repo)
+          break
+        case "fork":
+          await forkCodexEditor(repo)
+          break
+        case "new":
+          await openFreshCodexTab(repo)
+          break
+      }
+      return
+    }
+    case "archive-current": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length > 0) {
+        fail("archive-current does not accept arguments")
+      }
+      await archiveCurrentSession(repo)
+      return
+    }
+    default:
+      fail(`unknown command: ${command}`)
+  }
+}
+
+main().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error)
+  fail(message)
+})

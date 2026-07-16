@@ -1,0 +1,11 @@
+{
+  "name": "workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent Codex workspaces for Ghostty",
+  "scripts": {
+    "check": "node --check bin/ws && bash -n install.sh",
+    "test": "./test/install.sh"
+  }
+}
