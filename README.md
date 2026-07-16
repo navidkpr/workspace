@@ -17,6 +17,7 @@ ws  ⠙1    delivery    delivery  🔵1    trace_visibility
 - Packs conversations into configurable pane layouts.
 - Groups tabs belonging to the same workspace.
 - Shows live working and unread state in tab titles.
+- Pins important conversations with a persistent in-pane marker.
 - Archives Codex conversations when a workspace is removed.
 - Supports native Zsh completion and short command aliases.
 
@@ -90,6 +91,9 @@ Override the root with `CODEX_WS_ROOT`.
 | `ws sessions <name>` | | List a workspace's Codex sessions. |
 | `ws cp session <id>` | | Copy a Codex session into the current workspace. |
 | `ws mv session <id>` | | Move a Codex session into the current workspace. |
+| `ws pin <id>` | | Pin a Codex session. |
+| `ws unpin <id>` | | Unpin a Codex session. |
+| `ws pins` | | List pinned Codex sessions. |
 | `ws path <name>` | | Print a workspace path. |
 | `ws config` | `ws cfg` | Edit settings with `$VISUAL`, `$EDITOR`, or Vim. |
 
@@ -101,12 +105,15 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | --- | --- |
 | `Option+F` | Fork without interrupting the current conversation; the child starts with a handoff message. |
 | `Option+N` | Start a fresh Codex conversation using the layout policy. |
-| `Option+W` | Force-archive the current conversation and close its pane. |
+| `Option+W` | Archive the current conversation and close its pane; pinned chats require confirmation. |
 | `Option+R` | Toggle the current conversation between read and unread. |
 | `Option+Q` | Review the current workspace using the configured review mode. |
+| `Option+P` | Pin or unpin the current conversation. |
 | `Option+Enter` | Insert a newline in the Codex composer. |
 
 Clicking an unread pane marks it read. A thin Braille spinner means Codex is working; a blue circle means a conversation needs attention. Tabs with the same workspace are kept adjacent.
+
+Pinned conversations open first. Their pane gets a small `📌 pinned` footer, and moving a pinned conversation with `ws mv session` preserves its pin.
 
 ## Configuration
 

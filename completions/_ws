@@ -43,6 +43,9 @@ _ws() {
     "path:print a workspace path"
     "config:edit ws settings"
     "cfg:edit ws settings"
+    "pin:pin a Codex session"
+    "unpin:unpin a Codex session"
+    "pins:list pinned Codex sessions"
   )
 
   if (( CURRENT == 2 )); then
@@ -91,6 +94,12 @@ _ws() {
       _arguments \
         "2:object:(session)" \
         "3:session id:"
+      ;;
+    pin|unpin)
+      _arguments "2:session id:"
+      ;;
+    pins)
+      _arguments
       ;;
     sessions|path)
       _arguments "2:workspace:_ws_workspace"

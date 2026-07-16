@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import readline from "node:readline"
@@ -18,6 +18,7 @@ const configDirectory = path.resolve(
 const configPath = path.join(configDirectory, "config.json")
 const tmuxConfigPath = path.join(configDirectory, "tmux.conf")
 const titleDaemonPidPath = path.join(configDirectory, "title-daemon.pid")
+const pinnedSessionsDirectory = path.join(configDirectory, "pins")
 const tmuxSocketName = "codex-ws"
 const defaultConfig = {
   openMode: "window",
@@ -32,8 +33,10 @@ const newSessionEditorMarker = "__WS_NEW_SESSION__"
 const toggleAttentionEditorMarker = "__WS_TOGGLE_ATTENTION__"
 const reviewWorkspaceMarker = "__WS_REVIEW_WORKSPACE__"
 const reviewTabSuffix = " review"
+const togglePinMarker = "__WS_TOGGLE_PIN__"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
 const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently. Wait for my next message before starting new work."
+const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const fail = (message) => {
   process.stderr.write(`${commandName}: ${message}\n`)
@@ -68,6 +71,31 @@ const canonicalPath = (value) => {
   const resolved = path.resolve(value)
   return existsSync(resolved) ? realpathSync(resolved) : resolved
 }
+
+const pinnedSessionPath = (sessionId) => {
+  if (!sessionIdPattern.test(sessionId)) {
+    fail(`invalid Codex session ID: ${sessionId}`)
+  }
+  return path.join(pinnedSessionsDirectory, sessionId)
+}
+
+const sessionIsPinned = (sessionId) => existsSync(pinnedSessionPath(sessionId))
+
+const setSessionPinned = (sessionId, pinned) => {
+  const markerPath = pinnedSessionPath(sessionId)
+  if (pinned) {
+    mkdirSync(pinnedSessionsDirectory, { recursive: true })
+    writeFileSync(markerPath, `${sessionId}\n`)
+  } else {
+    rmSync(markerPath, { force: true })
+  }
+}
+
+const pinnedSessionIds = () => existsSync(pinnedSessionsDirectory)
+  ? readdirSync(pinnedSessionsDirectory)
+    .filter((entry) => sessionIdPattern.test(entry))
+    .sort()
+  : []
 
 const shellQuote = (value) => `'${value.replaceAll("'", `'\\''`)}'`
 
@@ -271,6 +299,9 @@ const usage = () => {
   ${commandName} remove|rm <name> [--force] [--keep-branch] [--dry-run]
   ${commandName} cp session <session-id>
   ${commandName} mv session <session-id>
+  ${commandName} pin <session-id>
+  ${commandName} unpin <session-id>
+  ${commandName} pins
   ${commandName} sessions <name|.>
   ${commandName} list|ls [--names-only]
   ${commandName} path <name|.>
@@ -291,6 +322,9 @@ Commands:
   remove, rm   Archive its Codex sessions, then delete the worktree and branch.
   cp session   Copy a Codex session into the current checkout with a new ID.
   mv session   Move a Codex session into the current checkout and archive the source.
+  pin          Pin a Codex session so it opens first and remains visually marked.
+  unpin        Remove a Codex session's pin.
+  pins         List pinned Codex sessions.
   sessions     List the sessions associated with a worktree.
   list, ls     List worktrees with activity, Git state, and latest session.
   path         Print a worktree's path. A name of "." means the current checkout.
@@ -323,6 +357,7 @@ Ghostty shortcuts:
   Option+W      Force-archive the current Codex session and close its pane.
   Option+R      Toggle the current persistent pane between read and unread.
   Option+Q      Review the current workspace using the configured review mode.
+  Option+P      Pin or unpin the current Codex session.
   Option+Enter  Insert a newline in the Codex composer.
 
 Environment:
@@ -687,7 +722,7 @@ const listTmuxRunners = () => {
   const sessionsResult = runTmux([
     "list-sessions",
     "-F",
-    "#{session_name}\t#{@ws_workspace}\t#{@ws_thread_id}\t#{@ws_launch_case}\t#{session_created}",
+    "#{session_name}\t#{@ws_workspace}\t#{@ws_thread_id}\t#{@ws_launch_case}\t#{session_created}\t#{@ws_pinned}",
   ], { allowFailure: true })
   if (sessionsResult.status !== 0) {
     return []
@@ -729,7 +764,7 @@ const listTmuxRunners = () => {
   }
 
   return sessionsResult.stdout.trim().split("\n").filter(Boolean).flatMap((line) => {
-    const [name, workspace, threadId, launchCase, createdAt] = line.split("\t")
+    const [name, workspace, threadId, launchCase, createdAt, pinState] = line.split("\t")
     const pane = panes.get(name)
     if (!name || !workspace || !pane?.paneTty) {
       return []
@@ -745,6 +780,7 @@ const listTmuxRunners = () => {
       panePid: Number(pane.panePid),
       paneTitle: pane.paneTitle,
       paneTty: pane.paneTty,
+      pinState: pinState || null,
       threadId: threadId || null,
       workspace: path.resolve(workspace),
     }]
@@ -939,7 +975,6 @@ const consumeToggleAttentionMarkers = (tabs, runnersByClientTty) => {
   }
   return restorations.length
 }
-
 const consumeForkSessionMarkers = (tabs, runnersByClientTty) => {
   const restorations = restoreMarkedTabs(tabs, runnersByClientTty, forkSessionMarker)
   for (const restoration of restorations) {
@@ -1001,6 +1036,35 @@ const consumeReviewWorkspaceMarkers = (tabs, runnersByClientTty) => {
   return restorations.length
 }
 
+const consumeTogglePinMarkers = (tabs, runnersByClientTty) => {
+  const restorations = restoreMarkedTabs(tabs, runnersByClientTty, togglePinMarker)
+  for (const restoration of restorations) {
+    const runner = restoration.runner
+    const sessionTty = runner?.paneTty ?? restoration.tty
+    const sessionId = runner?.threadId || sessionIdForTty(sessionTty)
+    if (!sessionId) {
+      if (runner) {
+        const pending = runner.pinState === "pending"
+        setRunnerPinned(runner.name, !pending, pending ? null : "pending")
+        runner.pinState = pending ? null : "pending"
+      } else {
+        spawnSync("osascript", [
+          "-e",
+          'display notification "Send a message before pinning this chat." with title "ws"',
+        ])
+      }
+      continue
+    }
+    const pinned = runner?.pinState === "1" || sessionIsPinned(sessionId)
+    setSessionPinned(sessionId, !pinned)
+    if (runner) {
+      setRunnerPinned(runner.name, !pinned)
+      runner.pinState = pinned ? null : "1"
+    }
+  }
+  return restorations.length
+}
+
 const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
   const moves = []
   const windows = new Map()
@@ -1017,7 +1081,8 @@ const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
       || tab.tabName === reviewWorkspaceMarker
-      || tab.tabName === toggleAttentionEditorMarker)) {
+      || tab.tabName === toggleAttentionEditorMarker
+      || tab.tabName === togglePinMarker)) {
       continue
     }
     const workspaceByTabId = new Map(windowTabs.map((tab) =>
@@ -1095,6 +1160,24 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   const runnersByClientTty = new Map()
   const allRunners = listTmuxRunners()
   for (const runner of allRunners) {
+    if (runner.pinState === "pending") {
+      const sessionId = sessionIdForTty(runner.paneTty)
+      if (sessionId) {
+        runTmux(["set-option", "-t", runner.name, "@ws_thread_id", sessionId])
+        setSessionPinned(sessionId, true)
+        setRunnerPinned(runner.name, true)
+        runner.threadId = sessionId
+        runner.pinState = "1"
+      }
+      continue
+    }
+    const pinned = runner.threadId !== null && sessionIsPinned(runner.threadId)
+    if (pinned !== (runner.pinState === "1")) {
+      setRunnerPinned(runner.name, pinned)
+      runner.pinState = pinned ? "1" : null
+    }
+  }
+  for (const runner of allRunners) {
     for (const tty of runner.clientTtys) {
       runnersByClientTty.set(tty, runner)
     }
@@ -1104,6 +1187,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   consumeForkSessionMarkers(tabs, runnersByClientTty)
   consumeToggleAttentionMarkers(tabs, runnersByClientTty)
   consumeReviewWorkspaceMarkers(tabs, runnersByClientTty)
+  consumeTogglePinMarkers(tabs, runnersByClientTty)
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
   const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
   const visibleStateNames = new Set()
@@ -1248,7 +1332,8 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       || tab.tabName === newSessionEditorMarker
       || tab.tabName === reviewWorkspaceMarker
       || tabIsReview(tab)
-      || tab.tabName === toggleAttentionEditorMarker) {
+      || tab.tabName === toggleAttentionEditorMarker
+      || tab.tabName === togglePinMarker) {
       return []
     }
     const runners = [...new Map(tab.terminalTtys
@@ -1476,6 +1561,9 @@ const startTmuxRunner = (workspace, launch) => {
   ]) {
     runTmux(["set-option", "-t", name, option, value])
   }
+  if (threadId && sessionIsPinned(threadId)) {
+    setRunnerPinned(name, true)
+  }
   return listTmuxRunners().find((runner) => runner.name === name) ?? {
     clientTtys: [],
     launchCase: launch.case,
@@ -1541,6 +1629,32 @@ const surfaceCommandForLaunch = (workspace, launch, sessionBackend = readConfig(
 
 const killTmuxRunner = (runnerName) => {
   runTmux(["kill-session", "-t", runnerName], { allowFailure: true })
+}
+
+const setRunnerPinned = (runnerName, pinned, state = pinned ? "1" : null) => {
+  if (!/^[A-Za-z0-9_.-]+$/.test(runnerName)) {
+    fail("invalid tmux runner name")
+  }
+  if (pinned) {
+    runTmux(["set-option", "-t", runnerName, "@ws_pinned", state ?? "1"])
+    runTmux(["set-option", "-t", runnerName, "status", "on"])
+    runTmux(["set-option", "-t", runnerName, "status-position", "bottom"])
+    runTmux(["set-option", "-t", runnerName, "status-style", "bg=default,fg=#d6b56f"])
+    runTmux([
+      "set-option",
+      "-t",
+      runnerName,
+      "status-format[0]",
+      "#[align=right]📌 pinned ",
+    ])
+    return
+  }
+  runTmux(["set-option", "-u", "-t", runnerName, "@ws_pinned"], {
+    allowFailure: true,
+  })
+  runTmux(["set-option", "-t", runnerName, "status", "off"], {
+    allowFailure: true,
+  })
 }
 
 const setRunnerAttention = (runnerName, action) => {
@@ -1722,7 +1836,25 @@ const listSessions = async (workspace) => {
   }
 }
 
+const readSessionById = async (sessionId) => {
+  const client = appServerClient()
+  try {
+    await initializeAppServerClient(client)
+    const result = await client.request("thread/read", {
+      includeTurns: false,
+      threadId: sessionId,
+    })
+    return isRecord(result) && isThread(result.thread) ? result.thread : null
+  } finally {
+    client.close()
+  }
+}
+
 const sessionsInStableOrder = (sessions) => [...sessions].sort((left, right) => {
+  const pinOrder = Number(sessionIsPinned(right.id)) - Number(sessionIsPinned(left.id))
+  if (pinOrder !== 0) {
+    return pinOrder
+  }
   const leftCreatedAt = typeof left.createdAt === "number" ? left.createdAt : left.updatedAt
   const rightCreatedAt = typeof right.createdAt === "number" ? right.createdAt : right.updatedAt
   return leftCreatedAt - rightCreatedAt || left.id.localeCompare(right.id)
@@ -1738,6 +1870,7 @@ const archiveSessions = async (sessions) => {
     await initializeAppServerClient(client)
     for (const session of sessions) {
       await client.request("thread/archive", { threadId: session.id })
+      setSessionPinned(session.id, false)
     }
   } finally {
     client.close()
@@ -2275,6 +2408,15 @@ const scheduleTmuxRunnerClose = (runnerName, tty, terminalId) => {
   child.unref()
 }
 
+const confirmPinnedArchive = (session) => {
+  const message = `Archive pinned chat: ${sessionLabel(session)}?`
+  const result = spawnSync("osascript", [
+    "-e",
+    `display dialog ${appleScriptQuote(message)} buttons {"Cancel", "Archive"} default button "Cancel" cancel button "Cancel" with icon caution`,
+  ], { encoding: "utf8" })
+  return result.status === 0
+}
+
 const archiveCurrentSession = async (repo) => {
   const sourceProcessTty = processTty(process.pid)
   const sourceGhosttyTty = currentGhosttyTty()
@@ -2283,8 +2425,11 @@ const archiveCurrentSession = async (repo) => {
   }
 
   const openSessionId = sessionIdForTty(sourceProcessTty)
+  const openSession = openSessionId
+    ? await readSessionById(openSessionId).catch(() => null)
+    : null
   const matchingSessions = openSessionId
-    ? [{ id: openSessionId }]
+    ? [openSession ?? { id: openSessionId }]
     : (await listSessions(repo.topLevel)).filter((session) => sessionProcessIds(session)
       .some((pid) => processTty(pid) === sourceProcessTty))
   const sourceTerminalId = ghosttyTerminalId(sourceGhosttyTty)
@@ -2302,6 +2447,10 @@ const archiveCurrentSession = async (repo) => {
   }
   if (matchingSessions.length > 1) {
     fail(`expected one Codex session on ${sourceProcessTty}, found ${matchingSessions.length}`)
+  }
+  if (sessionIsPinned(matchingSessions[0].id)
+    && !confirmPinnedArchive(matchingSessions[0])) {
+    return
   }
   await archiveSessions(matchingSessions)
   if (runner) {
@@ -2324,6 +2473,7 @@ const transferSession = async (repo, sessionId, operation) => {
     }
 
     const sourceSession = sourceResult.thread
+    const sourcePinned = sessionIsPinned(sessionId)
     if (operation === "move" && canonicalPath(sourceSession.cwd) === repo.topLevel) {
       fail(`session ${sessionId} is already in ${repo.topLevel}`)
     }
@@ -2374,6 +2524,10 @@ const transferSession = async (repo, sessionId, operation) => {
         break
       case "move":
         await client.request("thread/archive", { threadId: sessionId })
+        if (sourcePinned) {
+          setSessionPinned(sessionId, false)
+          setSessionPinned(copiedSession.id, true)
+        }
         if (sourceRunner) {
           const [firstTerminal, ...otherTerminals] = sourceTerminals
           if (firstTerminal) {
@@ -3081,13 +3235,14 @@ const printSessions = (sessions) => {
   }
 
   const runners = listTmuxRunners()
-  for (const session of sessions) {
+  for (const session of sessionsInStableOrder(sessions)) {
     const updated = new Date(session.updatedAt * 1000).toLocaleString()
     const runner = tmuxRunnerForSession(session, runners)
     const state = runner
       ? runner.clientTtys.length > 0 ? "open" : "detached"
       : sessionIsOpen(session) ? "direct" : "idle"
-    process.stdout.write(`${session.id}  ${state.padEnd(8)}  ${updated}  ${sessionLabel(session)}\n`)
+    const pin = sessionIsPinned(session.id) ? "📌" : "  "
+    process.stdout.write(`${pin} ${session.id}  ${state.padEnd(8)}  ${updated}  ${sessionLabel(session)}\n`)
   }
 }
 
@@ -3110,10 +3265,11 @@ const openWorkspace = async (workspace, options) => {
 
   process.stdout.write(`Finding non-archived Codex sessions in ${workspace}...\n`)
   const sessions = await listSessions(workspace)
+  const orderedSessions = sessionsInStableOrder(sessions)
   const ghosttyTtys = ghosttyTerminalTtys()
   const runners = tmuxRunnersForWorkspace(workspace)
   const matchedRunnerNames = new Set()
-  const classified = sessions.map((session) => {
+  const classified = orderedSessions.map((session) => {
     const processIds = sessionProcessIds(session)
     const processTtys = [...new Set(processIds.map(processTty).filter((tty) => tty !== null))]
     const runner = tmuxRunnerForSession(session, runners)
@@ -3400,6 +3556,8 @@ const managedWorkspaceEntries = async (repo) => {
     const name = path.relative(canonicalWorkspaceDirectory, workspace.path)
     const workspaceSessions = sessions.filter((session) =>
       pathContains(workspace.path, canonicalPath(session.cwd)))
+    const pinnedCount = workspaceSessions.filter((session) =>
+      sessionIsPinned(session.id)).length
     const latestSession = workspaceSessions[0]
     const workspaceStats = statSync(workspace.path)
     const createdAt = Math.max(workspaceStats.birthtimeMs, workspaceStats.mtimeMs) / 1000
@@ -3414,6 +3572,7 @@ const managedWorkspaceEntries = async (repo) => {
       latestSession: latestSession ? sessionLabel(latestSession) : "",
       name,
       path: workspace.path,
+      pinnedCount,
       sessions: workspaceSessions,
     }
   }).sort((left, right) => right.activity - left.activity)
@@ -3427,7 +3586,9 @@ const renderWorkspaceList = (entries) => {
   )
   const ageLabels = entries.map((entry) => relativeTime(entry.activity))
   const ageWidth = Math.max("updated".length, ...ageLabels.map((label) => label.length))
-  const chatsWidth = Math.max("chats".length, ...entries.map((entry) => String(entry.sessions.length).length))
+  const chatLabels = entries.map((entry) =>
+    `${entry.sessions.length}${entry.pinnedCount > 0 ? ` 📌${entry.pinnedCount}` : ""}`)
+  const chatsWidth = Math.max("chats".length, ...chatLabels.map((label) => [...label].length))
   const fixedWidth = 2 + nameWidth + 2 + ageWidth + 2 + 5 + 2 + chatsWidth
   const latestWidth = columns - fixedWidth - 2
   const showLatest = latestWidth >= 12
@@ -3460,7 +3621,7 @@ const renderWorkspaceList = (entries) => {
       "  ",
       gitState,
       "  ",
-      String(entry.sessions.length).padEnd(chatsWidth),
+      padColumn(chatLabels[index], chatsWidth),
     ]
     if (showLatest) {
       fields.push("  ", truncateText(entry.latestSession, latestWidth))
@@ -3478,8 +3639,8 @@ const pickerPreview = (entry) => {
     : "clean"
   const chatLines = entry.sessions.length === 0
     ? ["  No chats yet"]
-    : entry.sessions.map((session) =>
-      `  ${relativeTime(session.updatedAt).padEnd(8)} ${sessionLabel(session)}`)
+    : sessionsInStableOrder(entry.sessions).map((session) =>
+      `  ${sessionIsPinned(session.id) ? "📌" : "  "} ${relativeTime(session.updatedAt).padEnd(8)} ${sessionLabel(session)}`)
   return [
     entry.name,
     displayPath,
@@ -3514,7 +3675,8 @@ const pickWorkspace = async (repo) => {
       const marker = entry.current ? "●" : " "
       const dirty = entry.dirty ? "dirty" : ""
       const age = relativeTime(entry.activity).replace(" ago", "")
-      const display = `${marker} ${padColumn(entry.name, nameWidth)} ${age.padEnd(4)} ${dirty.padEnd(5)} ${entry.sessions.length}`
+      const pins = entry.pinnedCount > 0 ? ` 📌${entry.pinnedCount}` : ""
+      const display = `${marker} ${padColumn(entry.name, nameWidth)} ${age.padEnd(4)} ${dirty.padEnd(5)} ${entry.sessions.length}${pins}`
       return `${index}\t${display.trimEnd()}`
     }).join("\n")
     const previewCommand = `/bin/cat ${shellQuote(previewDirectory)}/{1}`
@@ -3725,6 +3887,38 @@ const reviewWorkspace = (workspace, mode, anchor = {}) => {
   }
 }
 
+const updateSessionPin = async (sessionId, pinned) => {
+  const session = await readSessionById(sessionId).catch(() => null)
+  if (pinned && !session) {
+    fail(`Codex session ${sessionId} does not exist`)
+  }
+  setSessionPinned(sessionId, pinned)
+  const runner = listTmuxRunners().find((candidate) =>
+    candidate.threadId === sessionId)
+  if (runner) {
+    setRunnerPinned(runner.name, pinned)
+  }
+  process.stdout.write(`${pinned ? "Pinned" : "Unpinned"} ${sessionId}${session ? ` · ${sessionLabel(session)}` : ""}.\n`)
+}
+
+const printPinnedSessions = async () => {
+  const sessionIds = pinnedSessionIds()
+  if (sessionIds.length === 0) {
+    process.stdout.write("No pinned sessions.\n")
+    return
+  }
+  const sessions = []
+  for (const sessionId of sessionIds) {
+    const session = await readSessionById(sessionId).catch(() => null)
+    if (session) {
+      sessions.push(session)
+    } else {
+      process.stdout.write(`📌 ${sessionId}  unavailable\n`)
+    }
+  }
+  printSessions(sessions)
+}
+
 const main = async () => {
   const [command, ...values] = process.argv.slice(2)
 
@@ -3933,6 +4127,23 @@ const main = async () => {
       )
       return
     }
+    case "pin":
+    case "unpin": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length !== 1) {
+        fail(`${command} requires exactly one session ID`)
+      }
+      await updateSessionPin(positional[0], command === "pin")
+      return
+    }
+    case "pins": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length > 0) {
+        fail("pins does not accept arguments")
+      }
+      await printPinnedSessions()
+      return
+    }
     case "sessions": {
       const { positional } = parseOptions(values, new Set())
       if (positional.length !== 1) {
@@ -3967,6 +4178,7 @@ const main = async () => {
       }
       switch (resolveEditorIntent(repo, positional[0])) {
         case "archive":
+          writeFileSync(positional[0], "")
           await archiveCurrentSession(repo)
           break
         case "fork":
