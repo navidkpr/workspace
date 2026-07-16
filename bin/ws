@@ -19,7 +19,7 @@ const configPath = path.join(configDirectory, "config.json")
 const tmuxConfigPath = path.join(configDirectory, "tmux.conf")
 const titleDaemonPidPath = path.join(configDirectory, "title-daemon.pid")
 const tmuxSocketName = "codex-ws"
-const defaultConfig = { openMode: "window", paneLayout: "1x2", sessionBackend: "direct" }
+const defaultConfig = { openMode: "window", paneLayout: "3-pane", sessionBackend: "direct" }
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
 const archiveEditorMarker = "__WS_ARCHIVE_CURRENT_SESSION__"
 const newSessionEditorMarker = "__WS_NEW_SESSION__"
@@ -107,10 +107,11 @@ const readConfig = () => {
     case "1x1":
     case "1x2":
     case "2x1":
+    case "3-pane":
     case "2x2":
       break
     default:
-      fail(`invalid paneLayout ${JSON.stringify(paneLayout)} in ${configPath}; expected "1x1", "1x2", "2x1", or "2x2"`)
+      fail(`invalid paneLayout ${JSON.stringify(paneLayout)} in ${configPath}; expected "1x1", "1x2", "2x1", "3-pane", or "2x2"`)
   }
 
   const sessionBackendResult = run("/usr/bin/plutil", [
@@ -281,8 +282,9 @@ Open modes:
 
 Pane layouts (set paneLayout in config):
   1x1          One session per tab.
-  1x2          Two side-by-side sessions per tab (default).
+  1x2          Two side-by-side sessions per tab.
   2x1          Two stacked sessions per tab.
+  3-pane       Pack sessions as 1, 1|1, then 2|1 (default).
   2x2          Pack forks as 1, 1|1, 2|1, 2|2, then start the next tab.
 
 Session backends (set sessionBackend in config):
@@ -1699,6 +1701,47 @@ const paneLayoutProvider = (paneLayout) => {
           ? [{ direction: "down", target: existing(layout.terminalIds[0]) }]
           : [],
       }
+    case "3-pane": {
+      const isCompatible = (layout) => {
+        switch (layout.terminalIds.length) {
+          case 0:
+          case 1:
+            return true
+          case 2:
+            return hasHorizontalEdge(layout) && !hasVerticalEdge(layout)
+          case 3:
+            return hasHorizontalEdge(layout) && hasVerticalEdge(layout)
+          default:
+            return false
+        }
+      }
+      const placements = (layout) => {
+        switch (layout.terminalIds.length) {
+          case 1:
+            return [
+              { direction: "right", target: existing(layout.terminalIds[0]) },
+              { direction: "down", target: existing(layout.terminalIds[0]) },
+            ]
+          case 2: {
+            const leftTerminalId = layout.terminalIds.find((terminalId) => {
+              const pane = layout.panes.find((candidate) => candidate.id === terminalId)
+              return pane && !pane.left && pane.right
+            })
+            return leftTerminalId
+              ? [{ direction: "down", target: existing(leftTerminalId) }]
+              : []
+          }
+          default:
+            return []
+        }
+      }
+      return {
+        canCompleteWithoutMoving: () => false,
+        capacity: 3,
+        isCompatible,
+        placements,
+      }
+    }
     case "2x2": {
       const isCompatible = (layout) => {
         switch (layout.terminalIds.length) {
