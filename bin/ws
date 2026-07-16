@@ -885,9 +885,11 @@ const workspaceStatusTabTitle = (
 ) => {
   const working = states.filter((state) => state?.working).length
   const attention = states.filter((state) => state?.needsAttention).length
+  const pinned = states.filter((state) => state?.pinned).length
   const indicators = [
     ...(working > 0 ? [`${loadingFrame}${working}`] : []),
     ...(attention > 0 ? [`🔵${attention}`] : []),
+    ...(pinned > 0 ? [`📌${pinned}`] : []),
   ]
   const status = indicators.length === 0 ? "" : `  ${indicators.join(" ")}`
   return `${path.basename(workspace)}${status}`
@@ -1303,6 +1305,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       focused,
       manualUnread,
       needsAttention,
+      pinned: runner.pinState !== null,
       tintedTtys: [...tintedTtys],
       working,
     })
@@ -1319,6 +1322,9 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
     const working = codexTitleIsWorking(terminal.title)
     const focused = focusedTtys.has(terminal.tty)
     const previous = runnerStates.get(stateName)
+    const sessionId = previous === undefined
+      ? sessionIdForTty(terminal.tty)
+      : previous.sessionId ?? null
     const manualAction = readDirectAttentionAction(terminal.tty)
     const focusChanged = focused && previous?.focused !== true
     const manualUnread = manualAction === "toggle"
@@ -1349,6 +1355,8 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       focused,
       manualUnread,
       needsAttention,
+      pinned: sessionId !== null && sessionIsPinned(sessionId),
+      sessionId,
       tintedTtys: [...tintedTtys],
       working,
     })

@@ -115,7 +115,7 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 
 Clicking an unread pane marks it read. A thin Braille spinner means Codex is working; a blue circle means a conversation needs attention. Tabs with the same workspace are kept adjacent.
 
-Named conversations show their name in the right-aligned pane footer. Pinned conversations open first and show `📌 pinned` beside the name. Names and pins survive reopen, repair, copy, and move.
+Named conversations show their name in the right-aligned pane footer. Pinned conversations open first, show `📌 pinned` beside the name, and contribute a `📌N` count to the tab title. Names and pins survive reopen, repair, copy, and move.
 
 ## Configuration
 
