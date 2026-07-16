@@ -22,7 +22,7 @@ const tmuxSocketName = "codex-ws"
 const defaultConfig = {
   openMode: "window",
   paneLayout: "1x3",
-  reviewMode: "cursor",
+  reviewMode: "lazygit",
   sessionBackend: "direct",
 }
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
@@ -313,8 +313,8 @@ Session backends (set sessionBackend in config):
   tmux         Keep Codex running when its Ghostty pane or tab closes.
 
 Review modes (set reviewMode in config):
-  cursor       Open the worktree in a classic Cursor IDE window (default).
-  lazygit      Open or focus a lazygit tab beside the workspace.
+  lazygit      Open or focus a lazygit tab beside the workspace (default).
+  cursor       Open the worktree in a new Cursor window.
   github       Open the branch PR, or a compare view when no PR exists.
 
 Ghostty shortcuts:
