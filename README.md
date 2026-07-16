@@ -154,7 +154,7 @@ Override the configured mode per invocation with `--tabs` or `--window`.
 
 ### Review modes
 
-- `cursor` opens the worktree in a classic Cursor IDE window. This is the default.
+- `cursor` opens the worktree in a classic Cursor IDE window with native diffs for its changes. This is the default.
 - `lazygit` opens or focuses a review tab beside the workspace.
 - `github` opens the current branch's pull request, falling back to a compare/diff page.
 

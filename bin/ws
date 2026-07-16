@@ -3935,6 +3935,70 @@ const launchCursorReview = (workspace) => {
   if (!cursor) {
     fail("Cursor's command-line tool is not installed")
   }
+
+  const remoteHead = run("git", [
+    "symbolic-ref",
+    "--quiet",
+    "--short",
+    "refs/remotes/origin/HEAD",
+  ], { allowFailure: true, cwd: workspace }).stdout.trim()
+  const baseReference = [remoteHead, "origin/main", "main", "origin/master", "master", "HEAD"]
+    .filter(Boolean)
+    .find((reference) => run("git", [
+      "rev-parse",
+      "--quiet",
+      "--verify",
+      `${reference}^{commit}`,
+    ], { allowFailure: true, cwd: workspace }).status === 0)
+  const reviewBase = run("git", [
+    "merge-base",
+    "HEAD",
+    baseReference ?? "HEAD",
+  ], { cwd: workspace }).stdout.trim()
+  const tracked = run("git", [
+    "diff",
+    "--name-only",
+    "-z",
+    reviewBase,
+    "--",
+  ], { cwd: workspace }).stdout.split("\0").filter(Boolean)
+  const untracked = run("git", [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  ], { cwd: workspace }).stdout.split("\0").filter(Boolean)
+  const changedFiles = [...new Set([...tracked, ...untracked])]
+  const reviewKey = createHash("sha256").update(workspace).digest("hex").slice(0, 16)
+  const reviewDirectory = path.join(tmpdir(), "ws-cursor-review", reviewKey)
+  rmSync(reviewDirectory, { force: true, recursive: true })
+  mkdirSync(reviewDirectory, { recursive: true })
+
+  const reviewPairs = changedFiles.flatMap((relativePath) => {
+    const currentPath = path.join(workspace, relativePath)
+    if (existsSync(currentPath) && !statSync(currentPath).isFile()) {
+      return []
+    }
+    const beforePath = path.join(reviewDirectory, "before", relativePath)
+    const afterPath = existsSync(currentPath)
+      ? currentPath
+      : path.join(reviewDirectory, "after", relativePath)
+    mkdirSync(path.dirname(beforePath), { recursive: true })
+    mkdirSync(path.dirname(afterPath), { recursive: true })
+    const before = spawnSync("git", ["show", `${reviewBase}:${relativePath}`], {
+      cwd: workspace,
+      encoding: null,
+      maxBuffer: 64 * 1024 * 1024,
+    })
+    writeFileSync(beforePath, before.status === 0 && before.stdout !== null
+      ? before.stdout
+      : Buffer.alloc(0))
+    if (!existsSync(currentPath)) {
+      writeFileSync(afterPath, Buffer.alloc(0))
+    }
+    return [{ afterPath, beforePath }]
+  })
+
   const openEditor = () => {
     const child = spawn(cursor, [workspace, "--classic"], {
       cwd: workspace,
@@ -3944,7 +4008,30 @@ const launchCursorReview = (workspace) => {
     child.unref()
   }
   openEditor()
-  setTimeout(openEditor, 1_500)
+  setTimeout(() => {
+    openEditor()
+    setTimeout(() => {
+      if (reviewPairs.length === 0) {
+        spawnSync("osascript", [
+          "-e",
+          `display notification ${appleScriptQuote("No workspace changes to review.")} with title ${appleScriptQuote("ws")}`,
+        ])
+        return
+      }
+      for (const pair of reviewPairs) {
+        spawnSync(cursor, [
+          "--reuse-window",
+          "--classic",
+          "--diff",
+          pair.beforePath,
+          pair.afterPath,
+        ], {
+          cwd: workspace,
+          stdio: "ignore",
+        })
+      }
+    }, 750)
+  }, 1_500)
 }
 
 const launchGitHubReview = (workspace) => {
