@@ -359,7 +359,7 @@ Ghostty shortcuts:
   Option+N      Open a new Codex session using the configured pane layout.
   Option+W      Force-archive the current Codex session and close its pane.
   Option+R      Toggle the current persistent pane between read and unread.
-  Option+Q      Review the current workspace using the configured review mode.
+  Option+J      Review the current workspace using the configured review mode.
   Option+K      Name the current Codex session.
   Option+P      Pin or unpin the current Codex session.
   Option+Enter  Insert a newline in the Codex composer.
@@ -934,7 +934,7 @@ const restoreMarkedTabs = (tabs, runnersByClientTty, marker) => {
     const runner = runnersByClientTty.get(tty)
     const workspace = workspaceForGhosttyTab(tab, runnersByClientTty)
     const title = workspace === null ? "Codex" : path.basename(workspace)
-    restorations.push({ runner, tab, title, tty })
+    restorations.push({ runner, tab, title, tty, workspace })
   }
 
   if (restorations.length === 0) {
@@ -1029,8 +1029,7 @@ const consumeReviewWorkspaceMarkers = (tabs, runnersByClientTty) => {
     reviewWorkspaceMarker,
   )
   for (const restoration of restorations) {
-    const workspace = restoration.runner?.workspace
-      ?? codexWorkspaceForTty(restoration.tty)
+    const workspace = restoration.workspace
     if (workspace) {
       scheduleWorkspaceReview(
         workspace,

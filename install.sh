@@ -37,6 +37,7 @@ if [[ "${WS_SKIP_GHOSTTY:-0}" != "1" ]]; then
   ghostty_config="$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty"
   install -d "$(dirname -- "$ghostty_config")"
   touch "$ghostty_config"
+  sed -i '' '/^keybind = alt+q=set_tab_title:__WS_REVIEW_WORKSPACE__$/d' "$ghostty_config"
   include_line="config-file = \"$config_dir/ghostty.conf\""
   if ! grep -Fqx "$include_line" "$ghostty_config"; then
     printf '\n# workspace\n%s\n' "$include_line" >>"$ghostty_config"

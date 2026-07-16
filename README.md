@@ -108,7 +108,7 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | `Option+N` | Start a fresh Codex conversation using the layout policy. |
 | `Option+W` | Archive the current conversation and close its pane; pinned chats require confirmation. |
 | `Option+R` | Toggle the current conversation between read and unread. |
-| `Option+Q` | Review the current workspace using the configured review mode. |
+| `Option+J` | Review the current workspace using the configured review mode. |
 | `Option+K` | Name the current conversation. |
 | `Option+P` | Pin or unpin the current conversation. |
 | `Option+Enter` | Insert a newline in the Codex composer. |
