@@ -26,6 +26,7 @@ grep -Fq 'keybind = alt+r=set_tab_title:__WS_TOGGLE_ATTENTION__' "$HOME/.config/
 test "$(grep -Fc '# workspace completion' "$HOME/.zshrc")" -eq 1
 ! grep -Fq '@WS_BIN@' "$HOME/.config/ws/tmux.conf"
 grep -Fq "$HOME/.local/bin/ws" "$HOME/.config/ws/tmux.conf"
+grep -Fq "xterm-ghostty:extkeys:hyperlinks" "$HOME/.config/ws/tmux.conf"
 "$HOME/.local/bin/ws" help >/dev/null
 
 printf 'install test passed\n'
