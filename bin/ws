@@ -23,6 +23,8 @@ const defaultConfig = { openMode: "window", paneLayout: "1x3", sessionBackend: "
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
 const archiveEditorMarker = "__WS_ARCHIVE_CURRENT_SESSION__"
 const newSessionEditorMarker = "__WS_NEW_SESSION__"
+const toggleAttentionEditorMarker = "__WS_TOGGLE_ATTENTION__"
+const directAttentionActionDirectory = path.join(configDirectory, "attention")
 const defaultForkMessage = "I forked the previous chat into this one. The original is continuing independently. Continue here with a separate task:\n"
 
 const fail = (message) => {
@@ -840,6 +842,58 @@ const workspaceForGhosttyTab = (tab, runnersByClientTty) => {
   return directWorkspaces.size === 1 ? [...directWorkspaces][0] : null
 }
 
+const consumeToggleAttentionMarkers = (tabs, runnersByClientTty) => {
+  const markedTabs = tabs.filter((tab) => tab.tabName === toggleAttentionEditorMarker)
+  if (markedTabs.length === 0) {
+    return 0
+  }
+
+  const restorations = []
+  for (const tab of markedTabs) {
+    const tty = tab.focusedTtys[0] ?? tab.terminalTtys[0]
+    if (!tty) {
+      continue
+    }
+    const runner = runnersByClientTty.get(tty)
+    const workspace = workspaceForGhosttyTab(tab, runnersByClientTty)
+    const title = workspace === null ? "Codex" : path.basename(workspace)
+    restorations.push({ runner, tab, title, tty })
+  }
+
+  if (restorations.length === 0) {
+    return 0
+  }
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    ...restorations.flatMap((restoration) => [
+      `if id of candidateTab is ${appleScriptQuote(restoration.tab.tabId)} then`,
+      `perform action ${appleScriptQuote(`set_tab_title:${restoration.title}`)} on focused terminal of candidateTab`,
+      "end if",
+    ]),
+    "end repeat",
+    "end repeat",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+  if (result.error || result.status !== 0) {
+    return 0
+  }
+  for (const restoration of restorations) {
+    restoration.tab.tabName = restoration.title
+    if (restoration.runner) {
+      toggleRunnerAttention(restoration.runner.name)
+    } else {
+      mkdirSync(directAttentionActionDirectory, { recursive: true })
+      writeFileSync(directAttentionActionPath(restoration.tty), "toggle\n")
+    }
+  }
+  return restorations.length
+}
+
 const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
   const moves = []
   const windows = new Map()
@@ -852,7 +906,9 @@ const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
   for (const [windowId, unsortedTabs] of windows) {
     const windowTabs = [...unsortedTabs].sort((left, right) => left.tabIndex - right.tabIndex)
     if (windowTabs.some((tab) =>
-      tab.tabName === archiveEditorMarker || tab.tabName === newSessionEditorMarker)) {
+      tab.tabName === archiveEditorMarker
+      || tab.tabName === newSessionEditorMarker
+      || tab.tabName === toggleAttentionEditorMarker)) {
       continue
     }
     const workspaceByTabId = new Map(windowTabs.map((tab) =>
@@ -936,6 +992,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   }
 
   const tabs = ghosttyTabSnapshots()
+  consumeToggleAttentionMarkers(tabs, runnersByClientTty)
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
   const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
   const visibleStateNames = new Set()
@@ -1027,13 +1084,22 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
     const working = codexTitleIsWorking(terminal.title)
     const focused = focusedTtys.has(terminal.tty)
     const previous = runnerStates.get(stateName)
-    const needsAttention = working
-      ? false
-      : focused
+    const manualAction = readDirectAttentionAction(terminal.tty)
+    const focusChanged = focused && previous?.focused !== true
+    const manualUnread = manualAction === "toggle"
+      ? !(previous?.manualUnread ?? previous?.needsAttention ?? false)
+      : focusChanged
         ? false
-        : previous?.working
-          ? true
-          : previous?.needsAttention ?? false
+        : previous?.manualUnread ?? false
+    const needsAttention = manualUnread
+      ? true
+      : working
+        ? false
+        : focused
+          ? false
+          : previous?.working
+            ? true
+            : previous?.needsAttention ?? false
     const tintedTtys = new Set(previous?.tintedTtys ?? [])
     if (needsAttention) {
       if (!tintedTtys.has(terminal.tty)
@@ -1046,7 +1112,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
     }
     runnerStates.set(stateName, {
       focused,
-      manualUnread: false,
+      manualUnread,
       needsAttention,
       tintedTtys: [...tintedTtys],
       working,
@@ -1064,7 +1130,9 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   let visibleWorkspace = false
   let working = false
   const updates = tabs.flatMap((tab) => {
-    if (tab.tabName === archiveEditorMarker || tab.tabName === newSessionEditorMarker) {
+    if (tab.tabName === archiveEditorMarker
+      || tab.tabName === newSessionEditorMarker
+      || tab.tabName === toggleAttentionEditorMarker) {
       return []
     }
     const runners = [...new Map(tab.terminalTtys
@@ -1388,6 +1456,21 @@ const toggleRunnerAttention = (runnerName) => {
     ? "read"
     : "unread"
   setRunnerAttention(runnerName, action)
+}
+
+const directAttentionActionPath = (tty) => path.join(
+  directAttentionActionDirectory,
+  `${path.basename(tty)}.action`,
+)
+
+const readDirectAttentionAction = (tty) => {
+  const actionPath = directAttentionActionPath(tty)
+  if (!existsSync(actionPath)) {
+    return null
+  }
+  const action = readFileSync(actionPath, "utf8").trim()
+  rmSync(actionPath, { force: true })
+  return action === "toggle" ? action : null
 }
 
 const ghosttyTerminalTtys = () => {
@@ -2083,14 +2166,22 @@ const archiveCurrentSession = async (repo) => {
     ? [{ id: openSessionId }]
     : (await listSessions(repo.topLevel)).filter((session) => sessionProcessIds(session)
       .some((pid) => processTty(pid) === sourceProcessTty))
-  if (matchingSessions.length !== 1) {
-    fail(`expected one Codex session on ${sourceProcessTty}, found ${matchingSessions.length}`)
-  }
   const sourceTerminalId = ghosttyTerminalId(sourceGhosttyTty)
   if (!sourceTerminalId) {
     fail(`could not find the Ghostty terminal for ${sourceGhosttyTty}`)
   }
   const runner = currentTmuxRunner()
+  if (matchingSessions.length === 0) {
+    if (runner) {
+      scheduleTmuxRunnerClose(runner.name, sourceGhosttyTty, sourceTerminalId)
+    } else {
+      scheduleGhosttyTerminalClose(sourceGhosttyTty, sourceTerminalId)
+    }
+    return
+  }
+  if (matchingSessions.length > 1) {
+    fail(`expected one Codex session on ${sourceProcessTty}, found ${matchingSessions.length}`)
+  }
   await archiveSessions(matchingSessions)
   if (runner) {
     scheduleTmuxRunnerClose(runner.name, sourceGhosttyTty, sourceTerminalId)
