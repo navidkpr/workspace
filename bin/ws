@@ -1714,8 +1714,10 @@ const renderRunnerFooter = (runnerName) => {
 
   const safeName = runnerFooterName(displayName).replaceAll("#", "##")
   const format = [
-    ...(safeName ? [`#[align=left,fg=#aeb4be] ${safeName}`] : []),
-    ...(pinned ? ["#[align=right,fg=#d6b56f]📌 pinned "] : []),
+    "#[align=right]",
+    ...(safeName ? [`#[fg=#aeb4be]${safeName}`] : []),
+    ...(safeName && pinned ? ["  "] : []),
+    ...(pinned ? ["#[fg=#d6b56f]📌 pinned "] : []),
   ].join("")
   runTmux(["set-option", "-t", runnerName, "status", "on"])
   runTmux(["set-option", "-t", runnerName, "status-position", "bottom"])
