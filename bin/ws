@@ -3926,12 +3926,16 @@ const launchCursorReview = (workspace) => {
   if (!cursor) {
     fail("Cursor's command-line tool is not installed")
   }
-  const child = spawn(cursor, [workspace, "--classic"], {
-    cwd: workspace,
-    detached: true,
-    stdio: "ignore",
-  })
-  child.unref()
+  const openEditor = () => {
+    const child = spawn(cursor, [workspace, "--classic"], {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore",
+    })
+    child.unref()
+  }
+  openEditor()
+  setTimeout(openEditor, 1_500)
 }
 
 const launchGitHubReview = (workspace) => {
