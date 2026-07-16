@@ -98,9 +98,8 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | `Option+F` | Fork the current Codex conversation into the next available pane. |
 | `Option+N` | Start a fresh Codex conversation using the layout policy. |
 | `Option+W` | Force-archive the current conversation and close its pane. |
-| `Control+R` | Toggle the current conversation between read and unread. |
-| `Option+R` | Alias for `Control+R`. |
-| `Shift+Enter` | Insert a newline in the Codex composer. |
+| `Option+R` | Toggle the current conversation between read and unread. |
+| `Option+Enter` | Insert a newline in the Codex composer. |
 
 Clicking an unread pane marks it read. A thin Braille spinner means Codex is working; a blue circle means a conversation needs attention. Tabs with the same workspace are kept adjacent.
 
