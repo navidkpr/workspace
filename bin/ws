@@ -22,11 +22,10 @@ const tmuxSocketName = "codex-ws"
 const defaultConfig = { openMode: "window", paneLayout: "1x3", sessionBackend: "direct" }
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
 const archiveEditorMarker = "__WS_ARCHIVE_CURRENT_SESSION__"
-const forkSessionMarker = "__WS_FORK_CURRENT_SESSION__"
 const newSessionEditorMarker = "__WS_NEW_SESSION__"
 const toggleAttentionEditorMarker = "__WS_TOGGLE_ATTENTION__"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
-const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently. Wait for my next message before starting new work."
+const defaultForkMessage = "This chat was forked from the previous conversation. The original was stopped at the fork point. Wait for my next message before starting new work."
 
 const fail = (message) => {
   process.stderr.write(`${commandName}: ${message}\n`)
@@ -900,33 +899,6 @@ const consumeToggleAttentionMarkers = (tabs, runnersByClientTty) => {
   }
   return restorations.length
 }
-
-const consumeForkSessionMarkers = (tabs, runnersByClientTty) => {
-  const restorations = restoreMarkedTabs(tabs, runnersByClientTty, forkSessionMarker)
-  for (const restoration of restorations) {
-    const sessionTty = restoration.runner?.paneTty ?? restoration.tty
-    const sessionId = restoration.runner?.threadId || sessionIdForTty(sessionTty)
-    const workspace = restoration.runner?.workspace
-      ?? codexWorkspaceForTty(restoration.tty)
-    if (!sessionId || !workspace) {
-      continue
-    }
-    const child = spawn(process.execPath, [
-      process.argv[1],
-      "fork-session",
-      workspace,
-      sessionId,
-      restoration.tty,
-    ], {
-      cwd: homedir(),
-      detached: true,
-      stdio: "ignore",
-    })
-    child.unref()
-  }
-  return restorations.length
-}
-
 const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
   const moves = []
   const windows = new Map()
@@ -940,7 +912,6 @@ const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
     const windowTabs = [...unsortedTabs].sort((left, right) => left.tabIndex - right.tabIndex)
     if (windowTabs.some((tab) =>
       tab.tabName === archiveEditorMarker
-      || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
       || tab.tabName === toggleAttentionEditorMarker)) {
       continue
@@ -1026,7 +997,6 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   }
 
   const tabs = ghosttyTabSnapshots()
-  consumeForkSessionMarkers(tabs, runnersByClientTty)
   consumeToggleAttentionMarkers(tabs, runnersByClientTty)
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
   const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
@@ -1166,7 +1136,6 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   let working = false
   const updates = tabs.flatMap((tab) => {
     if (tab.tabName === archiveEditorMarker
-      || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
       || tab.tabName === toggleAttentionEditorMarker) {
       return []
@@ -3572,22 +3541,6 @@ const main = async () => {
       fail("mark-attention requires a tmux runner name and read or unread")
     }
     setRunnerAttention(positional[0], positional[1])
-    return
-  }
-
-  if (command === "fork-session") {
-    const { positional } = parseOptions(values, new Set())
-    if (positional.length !== 3) {
-      fail("fork-session requires a workspace, session ID, and Ghostty TTY")
-    }
-    const [workspace, sessionId, tty] = positional
-    if (!existsSync(workspace) || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
-      fail("fork-session received an invalid workspace or session ID")
-    }
-    if (!/^\/dev\/ttys\d+$/.test(tty)) {
-      fail("fork-session received an invalid Ghostty TTY")
-    }
-    forkCodexSession(canonicalPath(workspace), { id: sessionId }, tty)
     return
   }
 
