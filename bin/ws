@@ -577,6 +577,41 @@ const processTty = (pid) => {
   return tty.startsWith("/dev/") ? tty : `/dev/${tty}`
 }
 
+const codexWorkspaceForTty = (tty) => {
+  if (!commandPath("lsof")) {
+    return null
+  }
+  const processIds = run("ps", [
+    "-o",
+    "pid=",
+    "-t",
+    path.basename(tty),
+  ], { allowFailure: true }).stdout
+    .trim()
+    .split(/\s+/)
+    .filter((pid) => /^\d+$/.test(pid))
+  for (const pid of processIds) {
+    if (path.basename(processExecutable(pid)) !== "codex") {
+      continue
+    }
+    const cwd = run("lsof", [
+      "-a",
+      "-p",
+      pid,
+      "-d",
+      "cwd",
+      "-Fn",
+    ], { allowFailure: true }).stdout
+      .split("\n")
+      .find((line) => line.startsWith("n"))
+      ?.slice(1)
+    if (cwd) {
+      return canonicalPath(cwd)
+    }
+  }
+  return null
+}
+
 const sessionIdForTty = (tty) => {
   if (!commandPath("lsof")) {
     return null
@@ -708,7 +743,7 @@ const ghosttyTabSnapshots = () => {
     "repeat with candidateTerminal in terminals of candidateTab",
     "set fieldSeparator to ASCII character 9",
     "set terminalIsFocused to ((id of candidateWindow is frontWindowId) and (id of candidateTab is id of selected tab of candidateWindow) and (id of candidateTerminal is focusedTerminalId))",
-    "set end of snapshotRows to (id of candidateWindow) & fieldSeparator & (id of candidateTab) & fieldSeparator & (name of candidateTab) & fieldSeparator & (candidateTabIndex as text) & fieldSeparator & (tty of candidateTerminal) & fieldSeparator & (terminalIsFocused as text)",
+    "set end of snapshotRows to (id of candidateWindow) & fieldSeparator & (id of candidateTab) & fieldSeparator & (name of candidateTab) & fieldSeparator & (candidateTabIndex as text) & fieldSeparator & (tty of candidateTerminal) & fieldSeparator & (terminalIsFocused as text) & fieldSeparator & (name of candidateTerminal)",
     "end repeat",
     "end repeat",
     "end repeat",
@@ -724,7 +759,7 @@ const ghosttyTabSnapshots = () => {
 
   const tabs = new Map()
   for (const line of result.stdout.trim().split("\n").filter(Boolean)) {
-    const [windowId, tabId, tabName, tabIndex, tty, focused] = line.split("\t")
+    const [windowId, tabId, tabName, tabIndex, tty, focused, ...terminalTitleParts] = line.split("\t")
     if (!windowId || !tabId || !tty) {
       continue
     }
@@ -733,9 +768,11 @@ const ghosttyTabSnapshots = () => {
       tabIndex: Number(tabIndex),
       tabName,
       focusedTtys: [],
+      terminals: [],
       terminalTtys: [],
       windowId,
     }
+    existing.terminals.push({ title: terminalTitleParts.join("\t"), tty })
     existing.terminalTtys.push(tty)
     if (focused === "true") {
       existing.focusedTtys.push(tty)
@@ -745,9 +782,19 @@ const ghosttyTabSnapshots = () => {
   return [...tabs.values()]
 }
 
-const codexRunnerIsWorking = (runner) =>
-  /^[\u2800-\u28ff]\s/u.test(runner.paneTitle ?? "")
-  || /^working\b/i.test(runner.paneTitle ?? "")
+const codexTitleIsWorking = (title) =>
+  /^[\u2800-\u28ff]\s/u.test(title ?? "")
+  || /^working\b/i.test(title ?? "")
+
+const codexRunnerIsWorking = (runner) => codexTitleIsWorking(runner.paneTitle)
+
+const workspaceFromCodexTerminalTitle = (title) => {
+  const workspace = title
+    .replace(/^[\u2800-\u28ff]\s+/u, "")
+    .replace(/^working\s+/i, "")
+    .trim()
+  return workspace && workspace !== "👻" ? workspace : null
+}
 
 const loadingFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 const attentionBackground = "#2b405f"
@@ -767,11 +814,9 @@ const setTerminalAttentionBackground = (tty, attention) => {
 
 const workspaceStatusTabTitle = (
   workspace,
-  runners,
-  runnerStates,
+  states,
   loadingFrame,
 ) => {
-  const states = runners.map((runner) => runnerStates.get(runner.name))
   const working = states.filter((state) => state?.working).length
   const attention = states.filter((state) => state?.needsAttention).length
   const indicators = [
@@ -786,7 +831,13 @@ const workspaceForGhosttyTab = (tab, runnersByClientTty) => {
   const workspaces = new Set(tab.terminalTtys
     .map((tty) => runnersByClientTty.get(tty)?.workspace)
     .filter((workspace) => typeof workspace === "string"))
-  return workspaces.size === 1 ? [...workspaces][0] : null
+  if (workspaces.size > 0) {
+    return workspaces.size === 1 ? [...workspaces][0] : null
+  }
+  const directWorkspaces = new Set(tab.terminals
+    .map((terminal) => workspaceFromCodexTerminalTitle(terminal.title))
+    .filter((workspace) => workspace !== null))
+  return directWorkspaces.size === 1 ? [...directWorkspaces][0] : null
 }
 
 const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
@@ -887,13 +938,13 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   const tabs = ghosttyTabSnapshots()
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
   const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
-  const visibleRunnerNames = new Set()
+  const visibleStateNames = new Set()
   for (const runner of allRunners) {
     const visible = runner.clientTtys.some((tty) => visibleTtys.has(tty))
     if (!visible) {
       continue
     }
-    visibleRunnerNames.add(runner.name)
+    visibleStateNames.add(runner.name)
     const working = codexRunnerIsWorking(runner)
     const focused = runner.clientTtys.some((tty) => focusedTtys.has(tty))
     const previous = runnerStates.get(runner.name)
@@ -966,8 +1017,43 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       working,
     })
   }
+  for (const terminal of tabs.flatMap((tab) => tab.terminals)) {
+    if (runnersByClientTty.has(terminal.tty)
+      || workspaceFromCodexTerminalTitle(terminal.title) === null) {
+      continue
+    }
+    const stateName = `direct:${terminal.tty}`
+    visibleStateNames.add(stateName)
+    const working = codexTitleIsWorking(terminal.title)
+    const focused = focusedTtys.has(terminal.tty)
+    const previous = runnerStates.get(stateName)
+    const needsAttention = working
+      ? false
+      : focused
+        ? false
+        : previous?.working
+          ? true
+          : previous?.needsAttention ?? false
+    const tintedTtys = new Set(previous?.tintedTtys ?? [])
+    if (needsAttention) {
+      if (!tintedTtys.has(terminal.tty)
+        && setTerminalAttentionBackground(terminal.tty, true)) {
+        tintedTtys.add(terminal.tty)
+      }
+    } else if (previous === undefined || tintedTtys.size > 0) {
+      setTerminalAttentionBackground(terminal.tty, false)
+      tintedTtys.clear()
+    }
+    runnerStates.set(stateName, {
+      focused,
+      manualUnread: false,
+      needsAttention,
+      tintedTtys: [...tintedTtys],
+      working,
+    })
+  }
   for (const runnerName of runnerStates.keys()) {
-    if (!visibleRunnerNames.has(runnerName)) {
+    if (!visibleStateNames.has(runnerName)) {
       for (const tty of runnerStates.get(runnerName)?.tintedTtys ?? []) {
         setTerminalAttentionBackground(tty, false)
       }
@@ -985,16 +1071,22 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       .map((tty) => runnersByClientTty.get(tty))
       .filter((runner) => runner !== undefined)
       .map((runner) => [runner.name, runner])).values()]
+    const directStateNames = tab.terminals
+      .filter((terminal) => !runnersByClientTty.has(terminal.tty))
+      .map((terminal) => `direct:${terminal.tty}`)
+    const states = [
+      ...runners.map((runner) => runnerStates.get(runner.name)),
+      ...directStateNames.map((stateName) => runnerStates.get(stateName)),
+    ].filter((state) => state !== undefined)
     const workspace = workspaceForGhosttyTab(tab, runnersByClientTty)
-    if (runners.length === 0 || workspace === null) {
+    if (states.length === 0 || workspace === null) {
       return []
     }
     visibleWorkspace = true
-    working ||= runners.some((runner) => runnerStates.get(runner.name)?.working)
+    working ||= states.some((state) => state.working)
     const title = workspaceStatusTabTitle(
       workspace,
-      runners,
-      runnerStates,
+      states,
       loadingFrame,
     )
     return title === tab.tabName ? [] : [{ tabId: tab.tabId, title }]
@@ -1599,6 +1691,26 @@ const ghosttyTabLayout = (tabId) => {
   }
 }
 
+const equalizeGhosttyTab = (tabId) => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    "repeat with candidateTab in tabs of candidateWindow",
+    `if id of candidateTab is ${appleScriptQuote(tabId)} then`,
+    `perform action ${appleScriptQuote("equalize_splits")} on focused terminal of candidateTab`,
+    "return true",
+    "end if",
+    "end repeat",
+    "end repeat",
+    "return false",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+  return !result.error && result.status === 0 && result.stdout.trim() === "true"
+}
+
 const paneNeighbor = (layout, terminalId, directions) => {
   const pane = layout.panes.find((candidate) => candidate.id === terminalId)
   if (!pane) {
@@ -2175,6 +2287,7 @@ const forkCodexEditor = async (repo) => {
     `set forkConfig to new surface configuration from {initial working directory:${appleScriptQuote(repo.topLevel)}, command:${appleScriptQuote(forkSurfaceCommand)}}`,
     "set forkTab to candidateTab",
     ...placementScript,
+    `perform action ${appleScriptQuote("equalize_splits")} on forkTerminal`,
     "select tab forkTab",
     "focus forkTerminal",
     "activate window candidateWindow",
@@ -2269,6 +2382,7 @@ const openFreshCodexTab = async (repo) => {
     `set sessionConfig to new surface configuration from {initial working directory:${appleScriptQuote(repo.topLevel)}, command:${appleScriptQuote(surfaceCommand)}}`,
     "set sessionTab to candidateTab",
     ...placementScript,
+    `perform action ${appleScriptQuote("equalize_splits")} on sessionTerminal`,
     "select tab sessionTab",
     "focus sessionTerminal",
     "activate window candidateWindow",
@@ -2387,6 +2501,7 @@ const launchCodexSessions = (
     }
 
     tabScript.push(
+      `perform action ${appleScriptQuote("equalize_splits")} on newestTerminal`,
       `perform action ${appleScriptQuote(`set_tab_title:${path.basename(workspace)}${tabTitleSuffix}`)} on topLeft`,
       "set newestTab to workspaceTab",
     )
@@ -2491,6 +2606,7 @@ const launchCodexSessionsAroundAnchor = (
       `set newestTerminal to createdPane${index}`,
     )
   }
+  script.push(`perform action ${appleScriptQuote("equalize_splits")} on newestTerminal`)
 
   for (let start = 0; start < remainingCommands.length; start += panesPerTab) {
     const tabCommands = remainingCommands.slice(start, start + panesPerTab)
@@ -2531,6 +2647,7 @@ const launchCodexSessionsAroundAnchor = (
       )
     }
     script.push(
+      `perform action ${appleScriptQuote("equalize_splits")} on newestTerminal`,
       `perform action ${appleScriptQuote(`set_tab_title:${path.basename(workspace)}${tabTitleSuffix}`)} on topLeft`,
     )
   }
@@ -2611,6 +2728,7 @@ const repairWorkspace = async (workspace, options) => {
   const anchorTabWorkspaceTerminalIdSet = new Set(anchorTabWorkspaceTerminalIds)
   const unrelatedPaneCount = layout.terminalIds.filter((terminalId) =>
     !anchorTabWorkspaceTerminalIdSet.has(terminalId)).length
+  const shouldEqualize = layout.terminalIds.length > 1
   const layoutProvider = paneLayoutProvider(options.pane_layout)
   const compatible = layoutProvider.isCompatible(layout)
   const activeSessionIds = new Set(allActiveTerminals.map((entry) => entry.session.id))
@@ -2648,7 +2766,7 @@ const repairWorkspace = async (workspace, options) => {
 
   if (options.dry_run) {
     if (compatible) {
-      process.stdout.write(`[dry-run] layout already matches ${options.pane_layout}; would keep ${activeTerminals.length} active Codex pane${activeTerminals.length === 1 ? "" : "s"}${unrelatedPaneCount === 0 ? "" : ` and ${unrelatedPaneCount} unrelated pane${unrelatedPaneCount === 1 ? "" : "s"}`} in place and open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"}\n`)
+      process.stdout.write(`[dry-run] layout already matches ${options.pane_layout}; would keep ${activeTerminals.length} active Codex pane${activeTerminals.length === 1 ? "" : "s"}${unrelatedPaneCount === 0 ? "" : ` and ${unrelatedPaneCount} unrelated pane${unrelatedPaneCount === 1 ? "" : "s"}`} in place${shouldEqualize ? ", equalize pane widths, and" : " and"} open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"}\n`)
       return
     }
     if (canCompleteWithoutMoving) {
@@ -2656,7 +2774,7 @@ const repairWorkspace = async (workspace, options) => {
       return
     }
     if (unrelatedPaneCount > 0) {
-      process.stdout.write(`[dry-run] would keep the mixed pane layout unchanged and open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"} in new tabs\n`)
+      process.stdout.write(`[dry-run] would keep every pane in the mixed layout${shouldEqualize ? ", equalize their widths, and" : " and"} open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"} in new tabs\n`)
       return
     }
     process.stdout.write(`[dry-run] would keep ${anchor.session.id} in the top-left position, restart ${terminalsToRestart.length} misplaced pane${terminalsToRestart.length === 1 ? "" : "s"}, and open ${missingSessions.length} missing session${missingSessions.length === 1 ? "" : "s"}\n`)
@@ -2664,12 +2782,18 @@ const repairWorkspace = async (workspace, options) => {
   }
 
   if (compatible && sessionsToResume.length === 0) {
-    process.stdout.write(`Layout already matches ${options.pane_layout}; kept ${activeTerminals.length} Codex pane${activeTerminals.length === 1 ? "" : "s"}${unrelatedPaneCount === 0 ? "" : ` and ${unrelatedPaneCount} unrelated pane${unrelatedPaneCount === 1 ? "" : "s"}`} unchanged.\n`)
+    if (shouldEqualize && !equalizeGhosttyTab(preferredAnchor.location.tabId)) {
+      fail("could not equalize the Ghostty pane widths")
+    }
+    process.stdout.write(`Layout already matches ${options.pane_layout}; kept ${activeTerminals.length} Codex pane${activeTerminals.length === 1 ? "" : "s"}${unrelatedPaneCount === 0 ? "" : ` and ${unrelatedPaneCount} unrelated pane${unrelatedPaneCount === 1 ? "" : "s"}`}${shouldEqualize ? " and equalized their widths" : " unchanged"}.\n`)
     return
   }
 
   if (!compatible && unrelatedPaneCount > 0 && sessionsToResume.length === 0) {
-    process.stdout.write(`Kept the mixed pane layout unchanged; no sessions were missing.\n`)
+    if (shouldEqualize && !equalizeGhosttyTab(preferredAnchor.location.tabId)) {
+      fail("could not equalize the Ghostty pane widths")
+    }
+    process.stdout.write(`Kept every pane in the mixed layout${shouldEqualize ? " and equalized their widths" : " unchanged"}; no sessions were missing.\n`)
     return
   }
 
@@ -2694,7 +2818,7 @@ const repairWorkspace = async (workspace, options) => {
   )
 }
 
-const repairAllTabsInCurrentWindow = async (options) => {
+const repairAllTabsInCurrentWindow = async (repo, options) => {
   const callerTty = currentGhosttyTty()
   const callerLocation = callerTty === null
     ? null
@@ -2712,14 +2836,28 @@ const repairAllTabsInCurrentWindow = async (options) => {
   const targets = ghosttyTabSnapshots()
     .filter((tab) => tab.windowId === callerLocation.windowId)
     .sort((left, right) => left.tabIndex - right.tabIndex)
-    .flatMap((tab) => [...new Set(tab.terminalTtys
-      .map((tty) => runnersByClientTty.get(tty)?.workspace)
-      .filter((workspace) => typeof workspace === "string"))]
-      .map((workspace) => ({
+    .flatMap((tab) => {
+      const detectedWorkspace = workspaceForGhosttyTab(tab, runnersByClientTty)
+      if (detectedWorkspace === null) {
+        return []
+      }
+      const directWorkspaces = new Set(tab.terminals
+        .filter((terminal) => !runnersByClientTty.has(terminal.tty))
+        .map((terminal) => codexWorkspaceForTty(terminal.tty))
+        .filter((workspace) => workspace !== null))
+      const workspace = path.isAbsolute(detectedWorkspace)
+        ? detectedWorkspace
+        : directWorkspaces.size === 1
+          ? [...directWorkspaces][0]
+          : detectedWorkspace === repo.name
+            ? repo.topLevel
+            : resolveWorkspace(repo, detectedWorkspace)
+      return [{
         tabId: tab.tabId,
         tabIndex: tab.tabIndex,
         workspace,
-      })))
+      }]
+    })
 
   if (targets.length === 0) {
     process.stdout.write("No workspace tabs found in this Ghostty window.\n")
@@ -3376,7 +3514,7 @@ const main = async () => {
         ...resolveLaunchSettings(options),
       }
       if (options.all) {
-        await repairAllTabsInCurrentWindow(repairOptions)
+        await repairAllTabsInCurrentWindow(repo, repairOptions)
       } else {
         await repairWorkspace(repo.topLevel, repairOptions)
       }

@@ -143,6 +143,7 @@ Repair is deliberately conservative:
 
 - Compatible panes stay where they are.
 - Unrelated panes are never removed.
+- Visible panes are equalized after creation and repair.
 - Missing Codex sessions are restored.
 - Misplaced Codex panes are restarted only when required by the selected layout.
 - `ws repair --all` is scoped to the current Ghostty window.
@@ -172,7 +173,7 @@ ws rm costs --keep-branch
 - tmux for persistent Codex processes
 - Ghostty's AppleScript and terminal APIs for tabs, panes, focus, titles, and layout
 
-The background title daemon observes Ghostty focus and tmux pane state every 250 ms while workspace tabs are visible. It owns only tab grouping, status titles, and unread-pane tinting.
+The background title daemon observes Ghostty terminal titles, focus, and tmux pane state every 250 ms while workspace tabs are visible. It supports both direct and tmux-backed Codex sessions and owns only tab grouping, status titles, and unread-pane tinting.
 
 ## Development
 
