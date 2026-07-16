@@ -19,12 +19,19 @@ const configPath = path.join(configDirectory, "config.json")
 const tmuxConfigPath = path.join(configDirectory, "tmux.conf")
 const titleDaemonPidPath = path.join(configDirectory, "title-daemon.pid")
 const tmuxSocketName = "codex-ws"
-const defaultConfig = { openMode: "window", paneLayout: "1x3", sessionBackend: "direct" }
+const defaultConfig = {
+  openMode: "window",
+  paneLayout: "1x3",
+  reviewMode: "cursor",
+  sessionBackend: "direct",
+}
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
 const archiveEditorMarker = "__WS_ARCHIVE_CURRENT_SESSION__"
 const forkSessionMarker = "__WS_FORK_CURRENT_SESSION__"
 const newSessionEditorMarker = "__WS_NEW_SESSION__"
 const toggleAttentionEditorMarker = "__WS_TOGGLE_ATTENTION__"
+const reviewWorkspaceMarker = "__WS_REVIEW_WORKSPACE__"
+const reviewTabSuffix = " review"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
 const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently. Wait for my next message before starting new work."
 
@@ -129,13 +136,26 @@ const readConfig = () => {
   const sessionBackend = sessionBackendResult.status === 0
     ? sessionBackendResult.stdout.trim()
     : defaultConfig.sessionBackend
-  switch (sessionBackend) {
-    case "direct":
-    case "tmux":
-      return { openMode, paneLayout, sessionBackend }
-    default:
-      fail(`invalid sessionBackend ${JSON.stringify(sessionBackend)} in ${configPath}; expected "direct" or "tmux"`)
+  if (!["direct", "tmux"].includes(sessionBackend)) {
+    fail(`invalid sessionBackend ${JSON.stringify(sessionBackend)} in ${configPath}; expected "direct" or "tmux"`)
   }
+
+  const reviewModeResult = run("/usr/bin/plutil", [
+    "-extract",
+    "reviewMode",
+    "raw",
+    "-o",
+    "-",
+    configPath,
+  ], { allowFailure: true })
+  const reviewMode = reviewModeResult.status === 0
+    ? reviewModeResult.stdout.trim()
+    : defaultConfig.reviewMode
+  if (!["cursor", "github", "lazygit"].includes(reviewMode)) {
+    fail(`invalid reviewMode ${JSON.stringify(reviewMode)} in ${configPath}; expected "lazygit", "cursor", or "github"`)
+  }
+
+  return { openMode, paneLayout, reviewMode, sessionBackend }
 }
 
 const editConfig = () => {
@@ -155,7 +175,7 @@ const editConfig = () => {
   }
 
   const config = readConfig()
-  process.stdout.write(`Saved ${configPath} (openMode: ${config.openMode}, paneLayout: ${config.paneLayout}, sessionBackend: ${config.sessionBackend}).\n`)
+  process.stdout.write(`Saved ${configPath} (openMode: ${config.openMode}, paneLayout: ${config.paneLayout}, reviewMode: ${config.reviewMode}, sessionBackend: ${config.sessionBackend}).\n`)
 }
 
 const resolveLaunchSettings = (options) => {
@@ -247,6 +267,7 @@ const usage = () => {
   ${commandName} new|ne <name> [--base <ref>] [--no-open] [--window|--tabs] [--dry-run]
   ${commandName} open|op <name|.> [--fresh] [--window|--tabs] [--dry-run]
   ${commandName} repair [--all] [--window|--tabs] [--dry-run]
+  ${commandName} review|rv <name|.> [--mode <lazygit|cursor|github>]
   ${commandName} remove|rm <name> [--force] [--keep-branch] [--dry-run]
   ${commandName} cp session <session-id>
   ${commandName} mv session <session-id>
@@ -266,6 +287,7 @@ Commands:
                Restarts only misplaced Codex panes and fills empty layout slots.
                The open mode is used only when no Codex pane is currently open.
                Use --all to repair every workspace tab in the current window.
+  review, rv   Review a workspace with lazygit, Cursor, or GitHub.
   remove, rm   Archive its Codex sessions, then delete the worktree and branch.
   cp session   Copy a Codex session into the current checkout with a new ID.
   mv session   Move a Codex session into the current checkout and archive the source.
@@ -290,11 +312,17 @@ Session backends (set sessionBackend in config):
   direct       Run Codex directly in its Ghostty pane.
   tmux         Keep Codex running when its Ghostty pane or tab closes.
 
+Review modes (set reviewMode in config):
+  cursor       Open the worktree in a classic Cursor IDE window (default).
+  lazygit      Open or focus a lazygit tab beside the workspace.
+  github       Open the branch PR, or a compare view when no PR exists.
+
 Ghostty shortcuts:
   Option+F      Fork the current Codex session into the configured pane layout.
   Option+N      Open a new Codex session using the configured pane layout.
   Option+W      Force-archive the current Codex session and close its pane.
   Option+R      Toggle the current persistent pane between read and unread.
+  Option+Q      Review the current workspace using the configured review mode.
   Option+Enter  Insert a newline in the Codex composer.
 
 Environment:
@@ -319,12 +347,12 @@ const parseOptions = (values, supported) => {
       fail(`unknown option: ${value}`)
     }
 
-    if (value === "--base") {
-      const base = values[index + 1]
-      if (!base || base.startsWith("--")) {
-        fail("--base requires a Git ref")
+    if (value === "--base" || value === "--mode") {
+      const optionValue = values[index + 1]
+      if (!optionValue || optionValue.startsWith("--")) {
+        fail(`${value} requires a value`)
       }
-      options.base = base
+      options[value.slice(2)] = optionValue
       index += 1
       continue
     }
@@ -825,7 +853,18 @@ const workspaceStatusTabTitle = (
   return `${path.basename(workspace)}${status}`
 }
 
+const reviewTabTitle = (workspace) => `${path.basename(workspace)}${reviewTabSuffix}`
+
+const tabIsReview = (tab) => tab.tabName.endsWith(reviewTabSuffix)
+
 const workspaceForGhosttyTab = (tab, runnersByClientTty) => {
+  if (tabIsReview(tab)) {
+    const workspaceName = tab.tabName.slice(0, -reviewTabSuffix.length)
+    const matchingWorkspaces = new Set([...runnersByClientTty.values()]
+      .map((runner) => runner.workspace)
+      .filter((workspace) => path.basename(workspace) === workspaceName))
+    return matchingWorkspaces.size === 1 ? [...matchingWorkspaces][0] : null
+  }
   const workspaces = new Set(tab.terminalTtys
     .map((tty) => runnersByClientTty.get(tty)?.workspace)
     .filter((workspace) => typeof workspace === "string"))
@@ -927,6 +966,41 @@ const consumeForkSessionMarkers = (tabs, runnersByClientTty) => {
   return restorations.length
 }
 
+const scheduleWorkspaceReview = (workspace, windowId, tabId) => {
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    "review-path",
+    workspace,
+    windowId,
+    tabId,
+  ], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
+}
+
+const consumeReviewWorkspaceMarkers = (tabs, runnersByClientTty) => {
+  const restorations = restoreMarkedTabs(
+    tabs,
+    runnersByClientTty,
+    reviewWorkspaceMarker,
+  )
+  for (const restoration of restorations) {
+    const workspace = restoration.runner?.workspace
+      ?? codexWorkspaceForTty(restoration.tty)
+    if (workspace) {
+      scheduleWorkspaceReview(
+        workspace,
+        restoration.tab.windowId,
+        restoration.tab.tabId,
+      )
+    }
+  }
+  return restorations.length
+}
+
 const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
   const moves = []
   const windows = new Map()
@@ -942,6 +1016,7 @@ const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
       tab.tabName === archiveEditorMarker
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
+      || tab.tabName === reviewWorkspaceMarker
       || tab.tabName === toggleAttentionEditorMarker)) {
       continue
     }
@@ -1028,6 +1103,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   const tabs = ghosttyTabSnapshots()
   consumeForkSessionMarkers(tabs, runnersByClientTty)
   consumeToggleAttentionMarkers(tabs, runnersByClientTty)
+  consumeReviewWorkspaceMarkers(tabs, runnersByClientTty)
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
   const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
   const visibleStateNames = new Set()
@@ -1109,7 +1185,9 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       working,
     })
   }
-  for (const terminal of tabs.flatMap((tab) => tab.terminals)) {
+  for (const terminal of tabs
+    .filter((tab) => !tabIsReview(tab))
+    .flatMap((tab) => tab.terminals)) {
     if (runnersByClientTty.has(terminal.tty)
       || workspaceFromCodexTerminalTitle(terminal.title) === null) {
       continue
@@ -1168,6 +1246,8 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
     if (tab.tabName === archiveEditorMarker
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
+      || tab.tabName === reviewWorkspaceMarker
+      || tabIsReview(tab)
       || tab.tabName === toggleAttentionEditorMarker) {
       return []
     }
@@ -2949,6 +3029,7 @@ const repairAllTabsInCurrentWindow = async (repo, options) => {
   }
   const targets = ghosttyTabSnapshots()
     .filter((tab) => tab.windowId === callerLocation.windowId)
+    .filter((tab) => !tabIsReview(tab))
     .sort((left, right) => left.tabIndex - right.tabIndex)
     .flatMap((tab) => {
       const detectedWorkspace = workspaceForGhosttyTab(tab, runnersByClientTty)
@@ -3497,6 +3578,148 @@ const listManagedWorkspaces = async (repo, options) => {
   renderWorkspaceList(entries)
 }
 
+const resolveReviewMode = (mode) => {
+  const selectedMode = mode ?? readConfig().reviewMode
+  if (!["cursor", "github", "lazygit"].includes(selectedMode)) {
+    fail(`invalid review mode ${JSON.stringify(selectedMode)}; expected lazygit, cursor, or github`)
+  }
+  return selectedMode
+}
+
+const focusGhosttyReviewTab = (title, windowId = "") => {
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    "repeat with candidateWindow in windows",
+    ...(windowId ? [`if id of candidateWindow is ${appleScriptQuote(windowId)} then`] : []),
+    "repeat with candidateTab in tabs of candidateWindow",
+    `if name of candidateTab is ${appleScriptQuote(title)} then`,
+    "select tab candidateTab",
+    "focus focused terminal of candidateTab",
+    "activate window candidateWindow",
+    "return true",
+    "end if",
+    "end repeat",
+    ...(windowId ? ["end if"] : []),
+    "end repeat",
+    "return false",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+  return !result.error && result.status === 0 && result.stdout.trim() === "true"
+}
+
+const launchLazygitReview = (workspace, anchor = {}) => {
+  const lazygit = commandPath("lazygit")
+  if (!lazygit) {
+    fail("lazygit is not installed; install it with: brew install lazygit")
+  }
+  const title = reviewTabTitle(workspace)
+  if (focusGhosttyReviewTab(title, anchor.windowId)
+    || (anchor.windowId && focusGhosttyReviewTab(title))) {
+    return
+  }
+
+  const command = `/bin/zsh -lc ${shellQuote(`exec ${shellQuote(lazygit)}`)}`
+  const script = [
+    'using terms from application "Ghostty"',
+    'tell application "Ghostty"',
+    `set reviewConfig to new surface configuration from {initial working directory:${appleScriptQuote(workspace)}, command:${appleScriptQuote(command)}}`,
+    "set reviewWindow to missing value",
+    "set anchorTab to missing value",
+    ...(anchor.windowId ? [
+      "repeat with candidateWindow in windows",
+      `if id of candidateWindow is ${appleScriptQuote(anchor.windowId)} then`,
+      "set reviewWindow to candidateWindow",
+      ...(anchor.tabId ? [
+        "repeat with candidateTab in tabs of candidateWindow",
+        `if id of candidateTab is ${appleScriptQuote(anchor.tabId)} then set anchorTab to candidateTab`,
+        "end repeat",
+      ] : []),
+      "end if",
+      "end repeat",
+    ] : []),
+    "if reviewWindow is missing value and (count of windows) > 0 then set reviewWindow to front window",
+    "if reviewWindow is missing value then",
+    "set reviewWindow to new window with configuration reviewConfig",
+    "set reviewTab to selected tab of reviewWindow",
+    "else",
+    "if anchorTab is not missing value then select tab anchorTab",
+    "set reviewTab to new tab in reviewWindow with configuration reviewConfig",
+    "end if",
+    "set reviewTerminal to focused terminal of reviewTab",
+    `perform action ${appleScriptQuote(`set_tab_title:${title}`)} on reviewTerminal`,
+    "select tab reviewTab",
+    "focus reviewTerminal",
+    "activate window reviewWindow",
+    "end tell",
+    "end using terms from",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
+  if (result.error || result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message
+    fail(detail || "could not open the lazygit review tab")
+  }
+}
+
+const launchCursorReview = (workspace) => {
+  const cursor = commandPath("cursor")
+  if (!cursor) {
+    fail("Cursor's command-line tool is not installed")
+  }
+  const child = spawn(cursor, ["--classic", "--new-window", workspace], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
+}
+
+const launchGitHubReview = (workspace) => {
+  const gh = commandPath("gh")
+  if (!gh) {
+    fail("GitHub CLI is not installed; install it with: brew install gh")
+  }
+  const pullRequest = run(gh, ["pr", "view", "--web"], {
+    allowFailure: true,
+    cwd: workspace,
+  })
+  if (pullRequest.status === 0) {
+    return
+  }
+  const branch = run("git", ["branch", "--show-current"], { cwd: workspace }).stdout.trim()
+  if (!branch) {
+    fail("GitHub review requires a branch; the workspace is in detached HEAD state")
+  }
+  const defaultBranch = run(gh, [
+    "repo",
+    "view",
+    "--json",
+    "defaultBranchRef",
+    "--jq",
+    ".defaultBranchRef.name",
+  ], { cwd: workspace }).stdout.trim()
+  if (!defaultBranch) {
+    fail("could not determine the GitHub repository's default branch")
+  }
+  run(gh, ["browse", `compare/${defaultBranch}...${branch}`], { cwd: workspace })
+}
+
+const reviewWorkspace = (workspace, mode, anchor = {}) => {
+  switch (resolveReviewMode(mode)) {
+    case "cursor":
+      launchCursorReview(workspace)
+      return
+    case "github":
+      launchGitHubReview(workspace)
+      return
+    case "lazygit":
+      launchLazygitReview(workspace, anchor)
+      return
+  }
+}
+
 const main = async () => {
   const [command, ...values] = process.argv.slice(2)
 
@@ -3554,6 +3777,22 @@ const main = async () => {
       fail("ensure-title-daemon does not accept arguments")
     }
     ensureTitleDaemon()
+    return
+  }
+
+  if (command === "review-path") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 3) {
+      fail("review-path requires a workspace, Ghostty window ID, and tab ID")
+    }
+    const workspace = canonicalPath(positional[0])
+    if (!existsSync(workspace)) {
+      fail(`workspace does not exist: ${workspace}`)
+    }
+    reviewWorkspace(workspace, undefined, {
+      tabId: positional[2],
+      windowId: positional[1],
+    })
     return
   }
 
@@ -3648,6 +3887,18 @@ const main = async () => {
       } else {
         await repairWorkspace(repo.topLevel, repairOptions)
       }
+      return
+    }
+    case "review":
+    case "rv": {
+      const { options, positional } = parseOptions(values, new Set(["--mode"]))
+      if (positional.length !== 1) {
+        fail("review requires exactly one workspace name or .")
+      }
+      const workspace = resolveWorkspace(repo, positional[0])
+      const sourceTty = currentGhosttyTty()
+      const sourceLocation = sourceTty ? ghosttyTerminalLocation(sourceTty) : null
+      reviewWorkspace(workspace, options.mode, sourceLocation ?? {})
       return
     }
     case "remove":

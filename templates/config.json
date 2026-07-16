@@ -1,5 +1,6 @@
 {
   "openMode": "tabs",
   "paneLayout": "1x3",
+  "reviewMode": "cursor",
   "sessionBackend": "tmux"
 }

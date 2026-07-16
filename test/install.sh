@@ -21,7 +21,9 @@ test -f "$HOME/.config/ws/config.json"
 test -f "$HOME/.config/ws/tmux.conf"
 test -f "$HOME/.config/ws/ghostty.conf"
 grep -Fq '"paneLayout": "1x3"' "$HOME/.config/ws/config.json"
+grep -Fq '"reviewMode": "cursor"' "$HOME/.config/ws/config.json"
 grep -Fq 'keybind = alt+r=set_tab_title:__WS_TOGGLE_ATTENTION__' "$HOME/.config/ws/ghostty.conf"
+grep -Fq 'keybind = alt+q=set_tab_title:__WS_REVIEW_WORKSPACE__' "$HOME/.config/ws/ghostty.conf"
 grep -Fq 'keybind = alt+f=set_tab_title:__WS_FORK_CURRENT_SESSION__' "$HOME/.config/ws/ghostty.conf"
 ! grep -A1 -F 'keybind = alt+r=' "$HOME/.config/ws/ghostty.conf" | tail -1 | grep -Fq 'chain='
 test "$(grep -Fc '# workspace completion' "$HOME/.zshrc")" -eq 1

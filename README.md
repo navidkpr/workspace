@@ -28,8 +28,11 @@ ws  ⠙1    delivery    delivery  🔵1    trace_visibility
 - Node.js 20 or newer
 - Git
 - tmux
+- Cursor for the default review mode
 - Zsh for shell completion
 - `fzf` for the optional interactive picker
+
+lazygit and GitHub CLI are optional backends for workspace review.
 
 ## Install
 
@@ -81,6 +84,7 @@ Override the root with `CODEX_WS_ROOT`.
 | `ws open <name>` | `ws op` | Restore the workspace's Codex sessions. |
 | `ws repair` | | Reconcile the current workspace's pane layout. |
 | `ws repair --all` | | Repair every workspace tab in the current Ghostty window. |
+| `ws review <name>` | `ws rv` | Review a workspace using lazygit, Cursor, or GitHub. |
 | `ws remove <name>` | `ws rm` | Archive sessions and remove the worktree and branch. |
 | `ws list` | `ws ls` | Show workspaces, activity, Git state, chats, and latest topic. |
 | `ws sessions <name>` | | List a workspace's Codex sessions. |
@@ -99,6 +103,7 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | `Option+N` | Start a fresh Codex conversation using the layout policy. |
 | `Option+W` | Force-archive the current conversation and close its pane. |
 | `Option+R` | Toggle the current conversation between read and unread. |
+| `Option+Q` | Review the current workspace using the configured review mode. |
 | `Option+Enter` | Insert a newline in the Codex composer. |
 
 Clicking an unread pane marks it read. A thin Braille spinner means Codex is working; a blue circle means a conversation needs attention. Tabs with the same workspace are kept adjacent.
@@ -111,6 +116,7 @@ Run `ws config` or edit `~/.config/ws/config.json`:
 {
   "openMode": "tabs",
   "paneLayout": "1x3",
+  "reviewMode": "cursor",
   "sessionBackend": "tmux"
 }
 ```
@@ -137,12 +143,26 @@ Override the configured mode per invocation with `--tabs` or `--window`.
 - `tmux` keeps Codex alive when its Ghostty surface closes.
 - `direct` runs Codex directly in Ghostty.
 
+### Review modes
+
+- `cursor` opens the worktree in a classic Cursor IDE window. This is the default.
+- `lazygit` opens or focuses a review tab beside the workspace.
+- `github` opens the current branch's pull request, falling back to a compare/diff page.
+
+Override the configured mode for one invocation:
+
+```bash
+ws review . --mode cursor
+ws review costs --mode github
+```
+
 ## Repair behavior
 
 Repair is deliberately conservative:
 
 - Compatible panes stay where they are.
 - Unrelated panes are never removed.
+- Review tabs are left untouched.
 - Visible panes are equalized after creation and repair.
 - Missing Codex sessions are restored.
 - Misplaced Codex panes are restarted only when required by the selected layout.

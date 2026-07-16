@@ -31,6 +31,8 @@ _ws() {
     "open:open a workspace"
     "op:open a workspace"
     "repair:reconcile sessions while preserving compatible pane positions"
+    "review:review a workspace"
+    "rv:review a workspace"
     "remove:archive sessions and remove a workspace"
     "rm:archive sessions and remove a workspace"
     "cp:copy a session into the current workspace"
@@ -72,6 +74,11 @@ _ws() {
         "--window[rebuild sessions in one new Ghostty window]" \
         "--tabs[rebuild sessions as tabs in the current Ghostty window]" \
         "--dry-run[print the relayout without executing it]"
+      ;;
+    review|rv)
+      _arguments \
+        "2:workspace:_ws_workspace" \
+        "--mode=[review interface]:mode:(lazygit cursor github)"
       ;;
     remove|rm|delete)
       _arguments \
