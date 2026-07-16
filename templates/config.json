@@ -1,6 +1,6 @@
 {
   "openMode": "tabs",
   "paneLayout": "1x3",
-  "reviewMode": "cursor",
+  "reviewMode": "delta",
   "sessionBackend": "tmux"
 }

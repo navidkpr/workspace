@@ -82,7 +82,7 @@ _ws() {
     review|rv)
       _arguments \
         "2:workspace:_ws_workspace" \
-        "--mode=[review interface]:mode:(lazygit cursor github)"
+        "--mode=[review interface]:mode:(delta lazygit cursor github)"
       ;;
     remove|rm|delete)
       _arguments \

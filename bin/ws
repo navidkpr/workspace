@@ -23,7 +23,7 @@ const tmuxSocketName = "codex-ws"
 const defaultConfig = {
   openMode: "window",
   paneLayout: "1x3",
-  reviewMode: "cursor",
+  reviewMode: "delta",
   sessionBackend: "direct",
 }
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
@@ -180,8 +180,8 @@ const readConfig = () => {
   const reviewMode = reviewModeResult.status === 0
     ? reviewModeResult.stdout.trim()
     : defaultConfig.reviewMode
-  if (!["cursor", "github", "lazygit"].includes(reviewMode)) {
-    fail(`invalid reviewMode ${JSON.stringify(reviewMode)} in ${configPath}; expected "lazygit", "cursor", or "github"`)
+  if (!["cursor", "delta", "github", "lazygit"].includes(reviewMode)) {
+    fail(`invalid reviewMode ${JSON.stringify(reviewMode)} in ${configPath}; expected "delta", "lazygit", "cursor", or "github"`)
   }
 
   return { openMode, paneLayout, reviewMode, sessionBackend }
@@ -296,7 +296,7 @@ const usage = () => {
   ${commandName} new|ne <name> [--base <ref>] [--no-open] [--window|--tabs] [--dry-run]
   ${commandName} open|op <name|.> [--fresh] [--window|--tabs] [--dry-run]
   ${commandName} repair [--all] [--window|--tabs] [--dry-run]
-  ${commandName} review|rv <name|.> [--mode <lazygit|cursor|github>]
+  ${commandName} review|rv <name|.> [--mode <delta|lazygit|cursor|github>]
   ${commandName} remove|rm <name> [--force] [--keep-branch] [--dry-run]
   ${commandName} cp session <session-id>
   ${commandName} mv session <session-id>
@@ -320,7 +320,7 @@ Commands:
                Restarts only misplaced Codex panes and fills empty layout slots.
                The open mode is used only when no Codex pane is currently open.
                Use --all to repair every workspace tab in the current window.
-  review, rv   Review a workspace with lazygit, Cursor, or GitHub.
+  review, rv   Review a workspace with Delta, lazygit, Cursor, or GitHub.
   remove, rm   Archive its Codex sessions, then delete the worktree and branch.
   cp session   Copy a Codex session into the current checkout with a new ID.
   mv session   Move a Codex session into the current checkout and archive the source.
@@ -350,7 +350,8 @@ Session backends (set sessionBackend in config):
   tmux         Keep Codex running when its Ghostty pane or tab closes.
 
 Review modes (set reviewMode in config):
-  cursor       Open the worktree in a classic Cursor IDE window (default).
+  delta        Open a clean, read-only side-by-side diff in Ghostty (default).
+  cursor       Open native diffs in a classic Cursor IDE window.
   lazygit      Open or focus a lazygit tab beside the workspace.
   github       Open the branch PR, or a compare view when no PR exists.
 
@@ -3847,10 +3848,32 @@ const listManagedWorkspaces = async (repo, options) => {
 
 const resolveReviewMode = (mode) => {
   const selectedMode = mode ?? readConfig().reviewMode
-  if (!["cursor", "github", "lazygit"].includes(selectedMode)) {
-    fail(`invalid review mode ${JSON.stringify(selectedMode)}; expected lazygit, cursor, or github`)
+  if (!["cursor", "delta", "github", "lazygit"].includes(selectedMode)) {
+    fail(`invalid review mode ${JSON.stringify(selectedMode)}; expected delta, lazygit, cursor, or github`)
   }
   return selectedMode
+}
+
+const reviewBaseForWorkspace = (workspace) => {
+  const remoteHead = run("git", [
+    "symbolic-ref",
+    "--quiet",
+    "--short",
+    "refs/remotes/origin/HEAD",
+  ], { allowFailure: true, cwd: workspace }).stdout.trim()
+  const baseReference = [remoteHead, "origin/main", "main", "origin/master", "master", "HEAD"]
+    .filter(Boolean)
+    .find((reference) => run("git", [
+      "rev-parse",
+      "--quiet",
+      "--verify",
+      `${reference}^{commit}`,
+    ], { allowFailure: true, cwd: workspace }).status === 0)
+  return run("git", [
+    "merge-base",
+    "HEAD",
+    baseReference ?? "HEAD",
+  ], { cwd: workspace }).stdout.trim()
 }
 
 const focusGhosttyReviewTab = (title, windowId = "") => {
@@ -3877,18 +3900,13 @@ const focusGhosttyReviewTab = (title, windowId = "") => {
   return !result.error && result.status === 0 && result.stdout.trim() === "true"
 }
 
-const launchLazygitReview = (workspace, anchor = {}) => {
-  const lazygit = commandPath("lazygit")
-  if (!lazygit) {
-    fail("lazygit is not installed; install it with: brew install lazygit")
-  }
+const launchGhosttyReviewTab = (workspace, command, anchor = {}) => {
   const title = reviewTabTitle(workspace)
   if (focusGhosttyReviewTab(title, anchor.windowId)
     || (anchor.windowId && focusGhosttyReviewTab(title))) {
     return
   }
 
-  const command = `/bin/zsh -lc ${shellQuote(`exec ${shellQuote(lazygit)}`)}`
   const script = [
     'using terms from application "Ghostty"',
     'tell application "Ghostty"',
@@ -3926,7 +3944,92 @@ const launchLazygitReview = (workspace, anchor = {}) => {
   const result = spawnSync("osascript", ["-"], { encoding: "utf8", input: script })
   if (result.error || result.status !== 0) {
     const detail = result.stderr?.trim() || result.error?.message
-    fail(detail || "could not open the lazygit review tab")
+    fail(detail || "could not open the Ghostty review tab")
+  }
+}
+
+const launchLazygitReview = (workspace, anchor = {}) => {
+  const lazygit = commandPath("lazygit")
+  if (!lazygit) {
+    fail("lazygit is not installed; install it with: brew install lazygit")
+  }
+  const command = `/bin/zsh -lc ${shellQuote(`exec ${shellQuote(lazygit)}`)}`
+  launchGhosttyReviewTab(workspace, command, anchor)
+}
+
+const launchDeltaReview = (workspace, anchor = {}) => {
+  const delta = commandPath("delta")
+  if (!delta) {
+    fail("Delta is not installed; install it with: brew install git-delta")
+  }
+  const command = `/bin/zsh -lc ${shellQuote(`exec ${shellQuote(process.execPath)} ${shellQuote(process.argv[1])} delta-review ${shellQuote(workspace)}`)}`
+  launchGhosttyReviewTab(workspace, command, anchor)
+}
+
+const renderDeltaReview = (workspace) => {
+  const delta = commandPath("delta")
+  if (!delta) {
+    fail("Delta is not installed; install it with: brew install git-delta")
+  }
+  const reviewBase = reviewBaseForWorkspace(workspace)
+  const tracked = spawnSync("git", [
+    "diff",
+    "--binary",
+    "--find-renames",
+    "--no-color",
+    reviewBase,
+    "--",
+  ], {
+    cwd: workspace,
+    encoding: null,
+    maxBuffer: 256 * 1024 * 1024,
+  })
+  if (tracked.error || tracked.status !== 0) {
+    fail(tracked.stderr?.toString().trim() || "could not build the workspace diff")
+  }
+  const untracked = run("git", [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  ], { cwd: workspace }).stdout.split("\0").filter(Boolean)
+  const chunks = [tracked.stdout ?? Buffer.alloc(0)]
+  for (const relativePath of untracked) {
+    const result = spawnSync("git", [
+      "diff",
+      "--no-index",
+      "--binary",
+      "--no-color",
+      "--",
+      "/dev/null",
+      relativePath,
+    ], {
+      cwd: workspace,
+      encoding: null,
+      maxBuffer: 256 * 1024 * 1024,
+    })
+    if (result.status === 1 && result.stdout !== null) {
+      chunks.push(result.stdout)
+    }
+  }
+  const patch = Buffer.concat(chunks.filter((chunk) => chunk.length > 0))
+  const input = patch.length > 0
+    ? patch
+    : Buffer.from("No changes to review.\n")
+  const result = spawnSync(delta, [
+    "--dark",
+    "--line-numbers",
+    "--navigate",
+    "--pager=less -R",
+    "--paging=always",
+    "--side-by-side",
+  ], {
+    cwd: workspace,
+    input,
+    stdio: ["pipe", "inherit", "inherit"],
+  })
+  if (result.error || result.status !== 0) {
+    fail(result.error?.message || `Delta exited with status ${result.status}`)
   }
 }
 
@@ -3936,25 +4039,7 @@ const launchCursorReview = (workspace) => {
     fail("Cursor's command-line tool is not installed")
   }
 
-  const remoteHead = run("git", [
-    "symbolic-ref",
-    "--quiet",
-    "--short",
-    "refs/remotes/origin/HEAD",
-  ], { allowFailure: true, cwd: workspace }).stdout.trim()
-  const baseReference = [remoteHead, "origin/main", "main", "origin/master", "master", "HEAD"]
-    .filter(Boolean)
-    .find((reference) => run("git", [
-      "rev-parse",
-      "--quiet",
-      "--verify",
-      `${reference}^{commit}`,
-    ], { allowFailure: true, cwd: workspace }).status === 0)
-  const reviewBase = run("git", [
-    "merge-base",
-    "HEAD",
-    baseReference ?? "HEAD",
-  ], { cwd: workspace }).stdout.trim()
+  const reviewBase = reviewBaseForWorkspace(workspace)
   const tracked = run("git", [
     "diff",
     "--name-only",
@@ -4068,6 +4153,9 @@ const reviewWorkspace = (workspace, mode, anchor = {}) => {
   switch (resolveReviewMode(mode)) {
     case "cursor":
       launchCursorReview(workspace)
+      return
+    case "delta":
+      launchDeltaReview(workspace, anchor)
       return
     case "github":
       launchGitHubReview(workspace)
@@ -4244,6 +4332,19 @@ const main = async () => {
       fail("ensure-title-daemon does not accept arguments")
     }
     ensureTitleDaemon()
+    return
+  }
+
+  if (command === "delta-review") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 1) {
+      fail("delta-review requires a workspace path")
+    }
+    const workspace = canonicalPath(positional[0])
+    if (!existsSync(workspace)) {
+      fail(`workspace does not exist: ${workspace}`)
+    }
+    renderDeltaReview(workspace)
     return
   }
 
