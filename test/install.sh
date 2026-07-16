@@ -20,7 +20,7 @@ test -f "$HOME/.zsh/completions/_ws"
 test -f "$HOME/.config/ws/config.json"
 test -f "$HOME/.config/ws/tmux.conf"
 test -f "$HOME/.config/ws/ghostty.conf"
-grep -Fq '"paneLayout": "3-pane"' "$HOME/.config/ws/config.json"
+grep -Fq '"paneLayout": "1x3"' "$HOME/.config/ws/config.json"
 test "$(grep -Fc '# workspace completion' "$HOME/.zshrc")" -eq 1
 ! grep -Fq '@WS_BIN@' "$HOME/.config/ws/tmux.conf"
 grep -Fq "$HOME/.local/bin/ws" "$HOME/.config/ws/tmux.conf"

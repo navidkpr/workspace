@@ -1,5 +1,5 @@
 {
   "openMode": "tabs",
-  "paneLayout": "3-pane",
+  "paneLayout": "1x3",
   "sessionBackend": "tmux"
 }

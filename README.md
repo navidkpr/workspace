@@ -110,7 +110,7 @@ Run `ws config` or edit `~/.config/ws/config.json`:
 ```json
 {
   "openMode": "tabs",
-  "paneLayout": "3-pane",
+  "paneLayout": "1x3",
   "sessionBackend": "tmux"
 }
 ```
@@ -128,8 +128,8 @@ Override the configured mode per invocation with `--tabs` or `--window`.
 | --- | --- |
 | `1x1` | One conversation per tab. |
 | `1x2` | Two side-by-side conversations: `A \| B`. |
+| `1x3` | Three side-by-side conversations: `A \| B \| C`. Default. |
 | `2x1` | Two stacked conversations. |
-| `3-pane` | Fill `1 → 1\|1 → 2\|1`, then create another tab. Default. |
 | `2x2` | Fill `1 → 1\|1 → 2\|1 → 2\|2`, then create another tab. |
 
 ### Session backends
