@@ -33,6 +33,7 @@ const newSessionEditorMarker = "__WS_NEW_SESSION__"
 const toggleAttentionEditorMarker = "__WS_TOGGLE_ATTENTION__"
 const reviewWorkspaceMarker = "__WS_REVIEW_WORKSPACE__"
 const reviewTabSuffix = " review"
+const nameSessionMarker = "__WS_NAME_SESSION__"
 const togglePinMarker = "__WS_TOGGLE_PIN__"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
 const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently. Wait for my next message before starting new work."
@@ -299,6 +300,7 @@ const usage = () => {
   ${commandName} remove|rm <name> [--force] [--keep-branch] [--dry-run]
   ${commandName} cp session <session-id>
   ${commandName} mv session <session-id>
+  ${commandName} name <session-id> <name>
   ${commandName} pin <session-id>
   ${commandName} unpin <session-id>
   ${commandName} pins
@@ -322,6 +324,7 @@ Commands:
   remove, rm   Archive its Codex sessions, then delete the worktree and branch.
   cp session   Copy a Codex session into the current checkout with a new ID.
   mv session   Move a Codex session into the current checkout and archive the source.
+  name         Give a Codex session a persistent display name.
   pin          Pin a Codex session so it opens first and remains visually marked.
   unpin        Remove a Codex session's pin.
   pins         List pinned Codex sessions.
@@ -357,6 +360,7 @@ Ghostty shortcuts:
   Option+W      Force-archive the current Codex session and close its pane.
   Option+R      Toggle the current persistent pane between read and unread.
   Option+Q      Review the current workspace using the configured review mode.
+  Option+K      Name the current Codex session.
   Option+P      Pin or unpin the current Codex session.
   Option+Enter  Insert a newline in the Codex composer.
 
@@ -1065,6 +1069,38 @@ const consumeTogglePinMarkers = (tabs, runnersByClientTty) => {
   return restorations.length
 }
 
+const consumeNameSessionMarkers = (tabs, runnersByClientTty) => {
+  const restorations = restoreMarkedTabs(tabs, runnersByClientTty, nameSessionMarker)
+  for (const restoration of restorations) {
+    const runner = restoration.runner
+    const sessionTty = runner?.paneTty ?? restoration.tty
+    const sessionId = runner?.threadId || sessionIdForTty(sessionTty)
+    if (!sessionId) {
+      spawnSync("osascript", [
+        "-e",
+        'display notification "Send a message before naming this chat." with title "ws"',
+      ])
+      continue
+    }
+    if (runner && runner.threadId !== sessionId) {
+      runTmux(["set-option", "-t", runner.name, "@ws_thread_id", sessionId])
+      runner.threadId = sessionId
+    }
+    const child = spawn(process.execPath, [
+      process.argv[1],
+      "name-session-dialog",
+      sessionId,
+      runner?.name ?? "-",
+    ], {
+      cwd: homedir(),
+      detached: true,
+      stdio: "ignore",
+    })
+    child.unref()
+  }
+  return restorations.length
+}
+
 const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
   const moves = []
   const windows = new Map()
@@ -1080,6 +1116,7 @@ const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
       tab.tabName === archiveEditorMarker
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
+      || tab.tabName === nameSessionMarker
       || tab.tabName === reviewWorkspaceMarker
       || tab.tabName === toggleAttentionEditorMarker
       || tab.tabName === togglePinMarker)) {
@@ -1187,6 +1224,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   consumeForkSessionMarkers(tabs, runnersByClientTty)
   consumeToggleAttentionMarkers(tabs, runnersByClientTty)
   consumeReviewWorkspaceMarkers(tabs, runnersByClientTty)
+  consumeNameSessionMarkers(tabs, runnersByClientTty)
   consumeTogglePinMarkers(tabs, runnersByClientTty)
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
   const focusedTtys = new Set(tabs.flatMap((tab) => tab.focusedTtys))
@@ -1330,6 +1368,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
     if (tab.tabName === archiveEditorMarker
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
+      || tab.tabName === nameSessionMarker
       || tab.tabName === reviewWorkspaceMarker
       || tabIsReview(tab)
       || tab.tabName === toggleAttentionEditorMarker
@@ -1561,6 +1600,13 @@ const startTmuxRunner = (workspace, launch) => {
   ]) {
     runTmux(["set-option", "-t", name, option, value])
   }
+  const displayName = launch.case === "resume"
+    && typeof launch.session.name === "string"
+    ? launch.session.name.trim()
+    : ""
+  if (displayName) {
+    setRunnerName(name, displayName)
+  }
   if (threadId && sessionIsPinned(threadId)) {
     setRunnerPinned(name, true)
   }
@@ -1631,30 +1677,75 @@ const killTmuxRunner = (runnerName) => {
   runTmux(["kill-session", "-t", runnerName], { allowFailure: true })
 }
 
-const setRunnerPinned = (runnerName, pinned, state = pinned ? "1" : null) => {
+const validateRunnerName = (runnerName) => {
   if (!/^[A-Za-z0-9_.-]+$/.test(runnerName)) {
     fail("invalid tmux runner name")
   }
-  if (pinned) {
-    runTmux(["set-option", "-t", runnerName, "@ws_pinned", state ?? "1"])
-    runTmux(["set-option", "-t", runnerName, "status", "on"])
-    runTmux(["set-option", "-t", runnerName, "status-position", "bottom"])
-    runTmux(["set-option", "-t", runnerName, "status-style", "bg=default,fg=#d6b56f"])
-    runTmux([
-      "set-option",
-      "-t",
-      runnerName,
-      "status-format[0]",
-      "#[align=right]📌 pinned ",
-    ])
+}
+
+const runnerOption = (runnerName, option) => {
+  const result = runTmux([
+    "show-options",
+    "-qv",
+    "-t",
+    runnerName,
+    option,
+  ], { allowFailure: true })
+  return result.status === 0 && result.stdout.trim()
+    ? result.stdout.trim()
+    : null
+}
+
+const runnerFooterName = (value) => {
+  const normalized = value.replaceAll(/\s+/g, " ").trim()
+  return normalized.length <= 48 ? normalized : `${normalized.slice(0, 47)}…`
+}
+
+const renderRunnerFooter = (runnerName) => {
+  validateRunnerName(runnerName)
+  const displayName = runnerOption(runnerName, "@ws_name") ?? ""
+  const pinned = runnerOption(runnerName, "@ws_pinned") !== null
+  if (!displayName && !pinned) {
+    runTmux(["set-option", "-t", runnerName, "status", "off"], {
+      allowFailure: true,
+    })
     return
   }
-  runTmux(["set-option", "-u", "-t", runnerName, "@ws_pinned"], {
-    allowFailure: true,
-  })
-  runTmux(["set-option", "-t", runnerName, "status", "off"], {
-    allowFailure: true,
-  })
+
+  const safeName = runnerFooterName(displayName).replaceAll("#", "##")
+  const format = [
+    ...(safeName ? [`#[align=left,fg=#aeb4be] ${safeName}`] : []),
+    ...(pinned ? ["#[align=right,fg=#d6b56f]📌 pinned "] : []),
+  ].join("")
+  runTmux(["set-option", "-t", runnerName, "status", "on"])
+  runTmux(["set-option", "-t", runnerName, "status-position", "bottom"])
+  runTmux(["set-option", "-t", runnerName, "status-style", "bg=default,fg=#aeb4be"])
+  runTmux(["set-option", "-t", runnerName, "status-format[0]", format])
+}
+
+const setRunnerName = (runnerName, displayName) => {
+  validateRunnerName(runnerName)
+  const normalized = displayName.replaceAll(/\s+/g, " ").trim()
+  if (normalized) {
+    runTmux(["set-option", "-t", runnerName, "@ws_name", normalized])
+  } else {
+    runTmux(["set-option", "-u", "-t", runnerName, "@ws_name"], {
+      allowFailure: true,
+    })
+  }
+  renderRunnerFooter(runnerName)
+}
+
+const setRunnerPinned = (runnerName, pinned, state = pinned ? "1" : null) => {
+  validateRunnerName(runnerName)
+  if (pinned) {
+    runTmux(["set-option", "-t", runnerName, "@ws_pinned", state ?? "1"])
+  } else {
+    runTmux(["set-option", "-u", "-t", runnerName, "@ws_pinned"], {
+      allowFailure: true,
+    })
+  }
+  renderRunnerFooter(runnerName)
 }
 
 const setRunnerAttention = (runnerName, action) => {
@@ -3887,6 +3978,83 @@ const reviewWorkspace = (workspace, mode, anchor = {}) => {
   }
 }
 
+const updateSessionName = async (
+  sessionId,
+  displayName,
+  runnerName = null,
+  announce = true,
+) => {
+  if (!sessionIdPattern.test(sessionId)) {
+    fail(`invalid Codex session ID: ${sessionId}`)
+  }
+  const normalized = displayName.replaceAll(/\s+/g, " ").trim()
+  if (!normalized) {
+    fail("chat name cannot be empty")
+  }
+  const session = await readSessionById(sessionId)
+  if (!session) {
+    fail(`Codex session ${sessionId} does not exist`)
+  }
+
+  const client = appServerClient()
+  try {
+    await initializeAppServerClient(client)
+    await client.request("thread/name/set", {
+      name: normalized,
+      threadId: sessionId,
+    })
+  } finally {
+    client.close()
+  }
+
+  const runners = listTmuxRunners()
+  const runner = runnerName === null
+    ? runners.find((candidate) => candidate.threadId === sessionId)
+    : runners.find((candidate) => candidate.name === runnerName)
+  if (runner) {
+    if (runner.threadId !== sessionId) {
+      runTmux(["set-option", "-t", runner.name, "@ws_thread_id", sessionId])
+    }
+    setRunnerName(runner.name, normalized)
+  }
+  if (announce) {
+    process.stdout.write(`Named ${sessionId} · ${normalized}.\n`)
+  }
+}
+
+const promptForSessionName = async (sessionId, runnerName) => {
+  const session = await readSessionById(sessionId)
+  if (!session) {
+    return
+  }
+  const currentName = typeof session.name === "string" ? session.name.trim() : ""
+  const script = [
+    `set dialogResult to display dialog ${appleScriptQuote("Name this chat:")} default answer ${appleScriptQuote(currentName)} buttons {"Cancel", "Save"} default button "Save" cancel button "Cancel"`,
+    "return text returned of dialogResult",
+  ].join("\n")
+  const result = spawnSync("osascript", ["-"], {
+    encoding: "utf8",
+    input: script,
+  })
+  if (result.error || result.status !== 0) {
+    return
+  }
+  const displayName = result.stdout.trim()
+  if (!displayName) {
+    spawnSync("osascript", [
+      "-e",
+      'display notification "A chat name cannot be empty." with title "ws"',
+    ])
+    return
+  }
+  await updateSessionName(
+    sessionId,
+    displayName,
+    runnerName === "-" ? null : runnerName,
+    false,
+  )
+}
+
 const updateSessionPin = async (sessionId, pinned) => {
   const session = await readSessionById(sessionId).catch(() => null)
   if (pinned && !session) {
@@ -4013,6 +4181,15 @@ const main = async () => {
     return
   }
 
+  if (command === "name-session-dialog") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 2) {
+      fail("name-session-dialog requires a session ID and runner name")
+    }
+    await promptForSessionName(positional[0], positional[1])
+    return
+  }
+
   if (command === "fork-session") {
     const { positional } = parseOptions(values, new Set())
     if (positional.length !== 3) {
@@ -4134,6 +4311,14 @@ const main = async () => {
         fail(`${command} requires exactly one session ID`)
       }
       await updateSessionPin(positional[0], command === "pin")
+      return
+    }
+    case "name": {
+      const { positional } = parseOptions(values, new Set())
+      if (positional.length < 2) {
+        fail("name requires a session ID and name")
+      }
+      await updateSessionName(positional[0], positional.slice(1).join(" "))
       return
     }
     case "pins": {

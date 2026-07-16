@@ -43,6 +43,7 @@ _ws() {
     "path:print a workspace path"
     "config:edit ws settings"
     "cfg:edit ws settings"
+    "name:name a Codex session"
     "pin:pin a Codex session"
     "unpin:unpin a Codex session"
     "pins:list pinned Codex sessions"
@@ -97,6 +98,11 @@ _ws() {
       ;;
     pin|unpin)
       _arguments "2:session id:"
+      ;;
+    name)
+      _arguments \
+        "2:session id:" \
+        "3:chat name:"
       ;;
     pins)
       _arguments

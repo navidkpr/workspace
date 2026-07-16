@@ -91,6 +91,7 @@ Override the root with `CODEX_WS_ROOT`.
 | `ws sessions <name>` | | List a workspace's Codex sessions. |
 | `ws cp session <id>` | | Copy a Codex session into the current workspace. |
 | `ws mv session <id>` | | Move a Codex session into the current workspace. |
+| `ws name <id> <name>` | | Give a Codex session a persistent display name. |
 | `ws pin <id>` | | Pin a Codex session. |
 | `ws unpin <id>` | | Unpin a Codex session. |
 | `ws pins` | | List pinned Codex sessions. |
@@ -108,12 +109,13 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | `Option+W` | Archive the current conversation and close its pane; pinned chats require confirmation. |
 | `Option+R` | Toggle the current conversation between read and unread. |
 | `Option+Q` | Review the current workspace using the configured review mode. |
+| `Option+K` | Name the current conversation. |
 | `Option+P` | Pin or unpin the current conversation. |
 | `Option+Enter` | Insert a newline in the Codex composer. |
 
 Clicking an unread pane marks it read. A thin Braille spinner means Codex is working; a blue circle means a conversation needs attention. Tabs with the same workspace are kept adjacent.
 
-Pinned conversations open first. Their pane gets a small `📌 pinned` footer, and moving a pinned conversation with `ws mv session` preserves its pin.
+Named conversations show their name on the left side of the pane footer. Pinned conversations open first and show `📌 pinned` on the right side of that same line. Names and pins survive reopen, repair, copy, and move.
 
 ## Configuration
 
