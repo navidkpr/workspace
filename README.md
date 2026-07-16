@@ -104,7 +104,7 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 
 | Shortcut | Action |
 | --- | --- |
-| `Option+F` | Fork without interrupting the current conversation; the child starts with a handoff message. |
+| `Option+F` | Fork without interrupting the current conversation; the child composer is prefilled with a handoff. |
 | `Option+N` | Start a fresh Codex conversation using the layout policy. |
 | `Option+W` | Archive the current conversation and close its pane; pinned chats require confirmation. |
 | `Option+R` | Toggle the current conversation between read and unread. |

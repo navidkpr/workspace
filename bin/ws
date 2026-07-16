@@ -36,7 +36,7 @@ const reviewTabSuffix = " review"
 const nameSessionMarker = "__WS_NAME_SESSION__"
 const togglePinMarker = "__WS_TOGGLE_PIN__"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
-const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently. Wait for my next message before starting new work."
+const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently."
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const fail = (message) => {
@@ -1572,7 +1572,7 @@ const codexArgumentsForLaunch = (launch) => {
     case "resume":
       return ["resume", launch.session.id]
     case "fork":
-      return ["fork", launch.session.id, launch.prompt]
+      return ["fork", launch.session.id]
     case "attach":
       fail("an attached tmux runner does not have Codex launch arguments")
   }
@@ -2764,7 +2764,58 @@ const forkCodexSession = (workspace, sourceSession, sourceTty) => {
     const detail = result.stderr?.trim() || result.error?.message
     fail(detail || "could not fork the Codex session into a Ghostty pane")
   }
+  const forkTty = result.stdout.trim()
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    "prefill-fork",
+    forkTty,
+    launch.prompt,
+  ], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
   ensureTitleDaemon()
+}
+
+const prefillForkComposer = async (tty, message) => {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const runner = listTmuxRunners().find((candidate) =>
+      candidate.clientTtys.includes(tty))
+    const sessionTty = runner?.paneTty ?? tty
+    if (sessionIdForTty(sessionTty)) {
+      await waitMilliseconds(300)
+      const script = [
+        'using terms from application "Ghostty"',
+        'tell application "Ghostty"',
+        "repeat with candidateWindow in windows",
+        "repeat with candidateTab in tabs of candidateWindow",
+        "repeat with candidateTerminal in terminals of candidateTab",
+        `if tty of candidateTerminal is ${appleScriptQuote(tty)} then`,
+        `perform action ${appleScriptQuote(`text:${message}`)} on candidateTerminal`,
+        `perform action ${appleScriptQuote("csi:13;2u")} on candidateTerminal`,
+        `perform action ${appleScriptQuote("csi:13;2u")} on candidateTerminal`,
+        "return true",
+        "end if",
+        "end repeat",
+        "end repeat",
+        "end repeat",
+        "return false",
+        "end tell",
+        "end using terms from",
+      ].join("\n")
+      const result = spawnSync("osascript", ["-"], {
+        encoding: "utf8",
+        input: script,
+      })
+      if (!result.error && result.status === 0 && result.stdout.trim() === "true") {
+        return
+      }
+    }
+    await waitMilliseconds(100)
+  }
 }
 
 const forkCodexEditor = async (repo) => {
@@ -4345,6 +4396,15 @@ const main = async () => {
       fail(`workspace does not exist: ${workspace}`)
     }
     renderDeltaReview(workspace)
+    return
+  }
+
+  if (command === "prefill-fork") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 2 || !/^\/dev\/ttys\d+$/.test(positional[0])) {
+      fail("prefill-fork requires a Ghostty TTY and message")
+    }
+    await prefillForkComposer(positional[0], positional[1])
     return
   }
 
