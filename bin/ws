@@ -22,7 +22,7 @@ const tmuxSocketName = "codex-ws"
 const defaultConfig = {
   openMode: "window",
   paneLayout: "1x3",
-  reviewMode: "lazygit",
+  reviewMode: "cursor",
   sessionBackend: "direct",
 }
 const forkEditorCommand = `${path.join(homedir(), ".local", "bin", "ws")} fork-editor`
@@ -313,8 +313,8 @@ Session backends (set sessionBackend in config):
   tmux         Keep Codex running when its Ghostty pane or tab closes.
 
 Review modes (set reviewMode in config):
-  lazygit      Open or focus a lazygit tab beside the workspace (default).
-  cursor       Open the worktree in a new Cursor window.
+  cursor       Open the worktree in a classic Cursor IDE window (default).
+  lazygit      Open or focus a lazygit tab beside the workspace.
   github       Open the branch PR, or a compare view when no PR exists.
 
 Ghostty shortcuts:
@@ -2224,6 +2224,7 @@ const forceCloseGhosttyTerminal = async (tty, terminalId) => {
   if (!terminalId) {
     fail("close-tty requires a Ghostty terminal ID")
   }
+  const sourceTabId = ghosttyTerminalLocation(tty)?.tabId ?? null
 
   signalTtyProcesses(tty, "-TERM")
   if (!await waitForTtyProcesses(tty, 50)) {
@@ -2235,6 +2236,10 @@ const forceCloseGhosttyTerminal = async (tty, terminalId) => {
   while (Date.now() < closeDeadline) {
     const closeResult = closeGhosttyTerminal(terminalId)
     if (closeResult === "missing") {
+      if (sourceTabId !== null) {
+        await waitMilliseconds(50)
+        equalizeGhosttyTab(sourceTabId)
+      }
       return
     }
     await waitMilliseconds(10)
