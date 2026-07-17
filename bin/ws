@@ -363,7 +363,7 @@ Ghostty shortcuts:
   Option+W      Force-archive the current Codex session and close its pane.
   Option+R      Toggle the current persistent pane between read and unread.
   Option+J      Review the current workspace using the configured review mode.
-  Control+Shift+J
+  Option+Shift+J
                 Review only the focused chat's latest finished turn.
   Option+K      Name the current Codex session.
   Option+P      Pin or unpin the current Codex session.
