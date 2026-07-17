@@ -32,7 +32,9 @@ const forkSessionMarker = "__WS_FORK_CURRENT_SESSION__"
 const newSessionEditorMarker = "__WS_NEW_SESSION__"
 const toggleAttentionEditorMarker = "__WS_TOGGLE_ATTENTION__"
 const reviewWorkspaceMarker = "__WS_REVIEW_WORKSPACE__"
+const reviewLastTurnMarker = "__WS_REVIEW_LAST_TURN__"
 const reviewTabSuffix = " review"
+const lastTurnReviewTabSuffix = " last turn review"
 const nameSessionMarker = "__WS_NAME_SESSION__"
 const togglePinMarker = "__WS_TOGGLE_PIN__"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
@@ -361,6 +363,8 @@ Ghostty shortcuts:
   Option+W      Force-archive the current Codex session and close its pane.
   Option+R      Toggle the current persistent pane between read and unread.
   Option+J      Review the current workspace using the configured review mode.
+  Control+Shift+J
+                Review only the focused chat's latest finished turn.
   Option+K      Name the current Codex session.
   Option+P      Pin or unpin the current Codex session.
   Option+Enter  Insert a newline in the Codex composer.
@@ -898,11 +902,18 @@ const workspaceStatusTabTitle = (
 
 const reviewTabTitle = (workspace) => `${path.basename(workspace)}${reviewTabSuffix}`
 
+const lastTurnReviewTabTitle = (workspace) =>
+  `${path.basename(workspace)}${lastTurnReviewTabSuffix}`
+
 const tabIsReview = (tab) => tab.tabName.endsWith(reviewTabSuffix)
+
+const reviewTabWorkspaceName = (tab) => tab.tabName.endsWith(lastTurnReviewTabSuffix)
+  ? tab.tabName.slice(0, -lastTurnReviewTabSuffix.length)
+  : tab.tabName.slice(0, -reviewTabSuffix.length)
 
 const workspaceForGhosttyTab = (tab, runnersByClientTty) => {
   if (tabIsReview(tab)) {
-    const workspaceName = tab.tabName.slice(0, -reviewTabSuffix.length)
+    const workspaceName = reviewTabWorkspaceName(tab)
     const matchingWorkspaces = new Set([...runnersByClientTty.values()]
       .map((runner) => runner.workspace)
       .filter((workspace) => path.basename(workspace) === workspaceName))
@@ -1042,6 +1053,58 @@ const consumeReviewWorkspaceMarkers = (tabs, runnersByClientTty) => {
   return restorations.length
 }
 
+const scheduleLastTurnReview = (
+  workspace,
+  sessionId,
+  windowId,
+  tabId,
+) => {
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    "last-turn-review-path",
+    workspace,
+    sessionId,
+    windowId,
+    tabId,
+  ], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore",
+  })
+  child.unref()
+}
+
+const consumeLastTurnReviewMarkers = (tabs, runnersByClientTty) => {
+  const restorations = restoreMarkedTabs(
+    tabs,
+    runnersByClientTty,
+    reviewLastTurnMarker,
+  )
+  for (const restoration of restorations) {
+    const workspace = restoration.workspace
+    if (!workspace) {
+      continue
+    }
+    const sessionTty = restoration.runner?.paneTty ?? restoration.tty
+    const sessionId = restoration.runner?.threadId
+      || sessionIdForTty(sessionTty)
+    if (!sessionId) {
+      spawnSync("osascript", [
+        "-e",
+        `display notification ${appleScriptQuote("Send a message before reviewing this chat's last turn.")} with title ${appleScriptQuote("ws")}`,
+      ])
+      continue
+    }
+    scheduleLastTurnReview(
+      workspace,
+      sessionId,
+      restoration.tab.windowId,
+      restoration.tab.tabId,
+    )
+  }
+  return restorations.length
+}
+
 const consumeTogglePinMarkers = (tabs, runnersByClientTty) => {
   const restorations = restoreMarkedTabs(tabs, runnersByClientTty, togglePinMarker)
   for (const restoration of restorations) {
@@ -1119,6 +1182,7 @@ const groupGhosttyWorkspaceTabs = (tabs, runnersByClientTty) => {
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
       || tab.tabName === nameSessionMarker
+      || tab.tabName === reviewLastTurnMarker
       || tab.tabName === reviewWorkspaceMarker
       || tab.tabName === toggleAttentionEditorMarker
       || tab.tabName === togglePinMarker)) {
@@ -1226,6 +1290,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
   consumeForkSessionMarkers(tabs, runnersByClientTty)
   consumeToggleAttentionMarkers(tabs, runnersByClientTty)
   consumeReviewWorkspaceMarkers(tabs, runnersByClientTty)
+  consumeLastTurnReviewMarkers(tabs, runnersByClientTty)
   consumeNameSessionMarkers(tabs, runnersByClientTty)
   consumeTogglePinMarkers(tabs, runnersByClientTty)
   const visibleTtys = new Set(tabs.flatMap((tab) => tab.terminalTtys))
@@ -1377,6 +1442,7 @@ const updateGhosttyTabTitles = (runnerStates, loadingFrame) => {
       || tab.tabName === forkSessionMarker
       || tab.tabName === newSessionEditorMarker
       || tab.tabName === nameSessionMarker
+      || tab.tabName === reviewLastTurnMarker
       || tab.tabName === reviewWorkspaceMarker
       || tabIsReview(tab)
       || tab.tabName === toggleAttentionEditorMarker
@@ -3951,8 +4017,12 @@ const focusGhosttyReviewTab = (title, windowId = "") => {
   return !result.error && result.status === 0 && result.stdout.trim() === "true"
 }
 
-const launchGhosttyReviewTab = (workspace, command, anchor = {}) => {
-  const title = reviewTabTitle(workspace)
+const launchGhosttyReviewTab = (
+  workspace,
+  command,
+  anchor = {},
+  title = reviewTabTitle(workspace),
+) => {
   if (focusGhosttyReviewTab(title, anchor.windowId)
     || (anchor.windowId && focusGhosttyReviewTab(title))) {
     return
@@ -4017,11 +4087,43 @@ const launchDeltaReview = (workspace, anchor = {}) => {
   launchGhosttyReviewTab(workspace, command, anchor)
 }
 
-const renderDeltaReview = (workspace) => {
+const launchLastTurnReview = (workspace, sessionId, anchor = {}) => {
   const delta = commandPath("delta")
   if (!delta) {
     fail("Delta is not installed; install it with: brew install git-delta")
   }
+  const command = `/bin/zsh -lc ${shellQuote(`exec ${shellQuote(process.execPath)} ${shellQuote(process.argv[1])} last-turn-delta-review ${shellQuote(workspace)} ${shellQuote(sessionId)}`)}`
+  launchGhosttyReviewTab(
+    workspace,
+    command,
+    anchor,
+    lastTurnReviewTabTitle(workspace),
+  )
+}
+
+const renderDeltaInput = (workspace, input) => {
+  const delta = commandPath("delta")
+  if (!delta) {
+    fail("Delta is not installed; install it with: brew install git-delta")
+  }
+  const result = spawnSync(delta, [
+    "--dark",
+    "--line-numbers",
+    "--navigate",
+    "--pager=less -R",
+    "--paging=always",
+    "--side-by-side",
+  ], {
+    cwd: workspace,
+    input,
+    stdio: ["pipe", "inherit", "inherit"],
+  })
+  if (result.error || result.status !== 0) {
+    fail(result.error?.message || `Delta exited with status ${result.status}`)
+  }
+}
+
+const renderDeltaReview = (workspace) => {
   const reviewBase = reviewBaseForWorkspace(workspace)
   const tracked = spawnSync("git", [
     "diff",
@@ -4067,21 +4169,63 @@ const renderDeltaReview = (workspace) => {
   const input = patch.length > 0
     ? patch
     : Buffer.from("No changes to review.\n")
-  const result = spawnSync(delta, [
-    "--dark",
-    "--line-numbers",
-    "--navigate",
-    "--pager=less -R",
-    "--paging=always",
-    "--side-by-side",
-  ], {
-    cwd: workspace,
-    input,
-    stdio: ["pipe", "inherit", "inherit"],
-  })
-  if (result.error || result.status !== 0) {
-    fail(result.error?.message || `Delta exited with status ${result.status}`)
+  renderDeltaInput(workspace, input)
+}
+
+const displayReviewPath = (workspace, filePath) => {
+  const relativePath = path.relative(workspace, filePath)
+  return relativePath
+    && relativePath !== ".."
+    && !relativePath.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relativePath)
+    ? relativePath
+    : filePath
+}
+
+const renderFileChangePatch = (workspace, change) => {
+  const sourcePath = displayReviewPath(workspace, change.path)
+  const destinationPath = change.kind?.type === "update" && change.kind.move_path
+    ? displayReviewPath(workspace, change.kind.move_path)
+    : sourcePath
+  const beforePath = change.kind?.type === "add" ? "/dev/null" : `a/${sourcePath}`
+  const afterPath = change.kind?.type === "delete" ? "/dev/null" : `b/${destinationPath}`
+  return [
+    `diff --git a/${sourcePath} b/${destinationPath}`,
+    `--- ${beforePath}`,
+    `+++ ${afterPath}`,
+    change.diff.trimEnd(),
+    "",
+  ].join("\n")
+}
+
+const renderLastTurnReview = async (workspace, sessionId) => {
+  const client = appServerClient()
+  let result
+  try {
+    await initializeAppServerClient(client)
+    result = await client.request("thread/read", {
+      includeTurns: true,
+      threadId: sessionId,
+    })
+  } finally {
+    client.close()
   }
+  const turns = Array.isArray(result?.thread?.turns)
+    ? result.thread.turns
+    : []
+  const turn = turns.findLast((candidate) => candidate.status !== "inProgress")
+  const changes = Array.isArray(turn?.items)
+    ? turn.items
+      .filter((item) => item.type === "fileChange" && item.status === "completed")
+      .flatMap((item) => item.changes)
+      .filter((change) => typeof change?.path === "string"
+        && typeof change?.diff === "string")
+    : []
+  const patch = changes
+    .map((change) => renderFileChangePatch(workspace, change))
+    .join("")
+  const input = Buffer.from(patch || "No file changes were recorded for the latest finished turn.\n")
+  renderDeltaInput(workspace, input)
 }
 
 const launchCursorReview = (workspace) => {
@@ -4396,6 +4540,35 @@ const main = async () => {
       fail(`workspace does not exist: ${workspace}`)
     }
     renderDeltaReview(workspace)
+    return
+  }
+
+  if (command === "last-turn-delta-review") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 2 || !sessionIdPattern.test(positional[1])) {
+      fail("last-turn-delta-review requires a workspace path and session ID")
+    }
+    const workspace = canonicalPath(positional[0])
+    if (!existsSync(workspace)) {
+      fail(`workspace does not exist: ${workspace}`)
+    }
+    await renderLastTurnReview(workspace, positional[1])
+    return
+  }
+
+  if (command === "last-turn-review-path") {
+    const { positional } = parseOptions(values, new Set())
+    if (positional.length !== 4 || !sessionIdPattern.test(positional[1])) {
+      fail("last-turn-review-path requires a workspace, session ID, window ID, and tab ID")
+    }
+    const workspace = canonicalPath(positional[0])
+    if (!existsSync(workspace)) {
+      fail(`workspace does not exist: ${workspace}`)
+    }
+    launchLastTurnReview(workspace, positional[1], {
+      tabId: positional[3],
+      windowId: positional[2],
+    })
     return
   }
 

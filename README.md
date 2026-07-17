@@ -109,11 +109,14 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | `Option+W` | Archive the current conversation and close its pane; pinned chats require confirmation. |
 | `Option+R` | Toggle the current conversation between read and unread. |
 | `Option+J` | Review the current workspace using the configured review mode. |
+| `Control+Shift+J` | Review only the focused conversation's latest finished turn. |
 | `Option+K` | Name the current conversation. |
 | `Option+P` | Pin or unpin the current conversation. |
 | `Option+Enter` | Insert a newline in the Codex composer. |
 
 Clicking an unread pane marks it read. A thin Braille spinner means Codex is working; a blue circle means a conversation needs attention. Tabs with the same workspace are kept adjacent.
+
+Control+Shift+J reads the focused conversation's own latest finished turn from Codex and renders only its recorded file changes in Delta, so concurrent panes in the same worktree do not get mixed together.
 
 Named conversations show their name in the right-aligned pane footer. Pinned conversations open first, show `📌 pinned` beside the name, and contribute a `📌N` count to the tab title. Names and pins survive reopen, repair, copy, and move.
 
