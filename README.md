@@ -150,6 +150,8 @@ Override the configured mode per invocation with `--tabs` or `--window`.
 | `2x1` | Two stacked conversations. |
 | `2x2` | Fill `1 → 1\|1 → 2\|1 → 2\|2`, then create another tab. |
 
+Forks and fresh conversations fill an existing partial tab for that workspace before creating another tab.
+
 ### Session backends
 
 - `tmux` keeps Codex alive when its Ghostty surface closes.

@@ -2466,6 +2466,62 @@ const paneLayoutProvider = (paneLayout) => {
   }
 }
 
+const workspacePanePlacement = (
+  workspace,
+  sourceLocation,
+  layoutProvider,
+) => {
+  const runnersByClientTty = new Map()
+  for (const runner of listTmuxRunners()) {
+    for (const tty of runner.clientTtys) {
+      runnersByClientTty.set(tty, runner)
+    }
+  }
+  const resolvedWorkspace = canonicalPath(workspace)
+  const tabs = ghosttyTabSnapshots()
+    .filter((tab) => tab.windowId === sourceLocation.windowId)
+    .filter((tab) => !tabIsReview(tab))
+    .sort((left, right) => left.tabIndex - right.tabIndex)
+  const sourceTab = tabs.find((tab) => tab.tabId === sourceLocation.tabId)
+  const otherWorkspaceTabs = tabs.filter((tab) => {
+    if (tab.tabId === sourceLocation.tabId) {
+      return false
+    }
+    const terminalWorkspaces = tab.terminals.map((terminal) => {
+      const runnerWorkspace = runnersByClientTty.get(terminal.tty)?.workspace
+      const detectedWorkspace = runnerWorkspace ?? codexWorkspaceForTty(terminal.tty)
+      return detectedWorkspace ? canonicalPath(detectedWorkspace) : null
+    })
+    return terminalWorkspaces.length > 0
+      && terminalWorkspaces.every((detectedWorkspace) =>
+        detectedWorkspace === resolvedWorkspace)
+  })
+  const candidates = [
+    ...(sourceTab ? [sourceTab] : []),
+    ...otherWorkspaceTabs,
+  ]
+
+  for (const tab of candidates) {
+    if (tab.terminalTtys.length >= layoutProvider.capacity) {
+      continue
+    }
+    const layout = ghosttyTabLayout(tab.tabId)
+    if (!layoutProvider.isCompatible(layout)) {
+      continue
+    }
+    const placement = layoutProvider.placements(layout)[0]
+    if (placement?.target.case === "existing") {
+      return { layout, placement, tabId: tab.tabId }
+    }
+  }
+
+  return {
+    layout: ghosttyTabLayout(sourceLocation.tabId),
+    placement: null,
+    tabId: null,
+  }
+}
+
 const closeGhosttyTerminal = (terminalId) => {
   const script = [
     'using terms from application "Ghostty"',
@@ -2780,8 +2836,12 @@ const forkCodexSession = (workspace, sourceSession, sourceTty) => {
     fail("could not find the current Ghostty pane")
   }
   const layoutProvider = paneLayoutProvider(readConfig().paneLayout)
-  const layout = ghosttyTabLayout(sourceLocation.tabId)
-  const placement = layoutProvider.placements(layout)[0]
+  const panePlacement = workspacePanePlacement(
+    workspace,
+    sourceLocation,
+    layoutProvider,
+  )
+  const { layout, placement } = panePlacement
 
   const launch = forkLaunch(sourceSession, defaultForkMessage)
   const forkSurfaceCommand = surfaceCommandForLaunch(workspace, launch)
@@ -2812,8 +2872,13 @@ const forkCodexSession = (workspace, sourceSession, sourceTty) => {
       fail("the next fork placement must target an existing pane")
     }
     return [
+      "set forkTab to missing value",
+      "repeat with targetTab in tabs of candidateWindow",
+      `if id of targetTab is ${appleScriptQuote(panePlacement.tabId)} then set forkTab to targetTab`,
+      "end repeat",
+      "if forkTab is missing value then error \"the planned fork tab no longer exists\"",
       "set splitTarget to missing value",
-      "repeat with candidateTerminal in terminals of candidateTab",
+      "repeat with candidateTerminal in terminals of forkTab",
       `if id of candidateTerminal is ${appleScriptQuote(placement.target.terminalId)} then set splitTarget to candidateTerminal`,
       "end repeat",
       "if splitTarget is missing value then error \"the planned fork target no longer exists\"",
@@ -2832,7 +2897,6 @@ const forkCodexSession = (workspace, sourceSession, sourceTty) => {
     "end repeat",
     "if sourceTerminal is not missing value then",
     `set forkConfig to new surface configuration from {initial working directory:${appleScriptQuote(workspace)}, command:${appleScriptQuote(forkSurfaceCommand)}}`,
-    "set forkTab to candidateTab",
     ...placementScript,
     `perform action ${appleScriptQuote("equalize_splits")} on forkTerminal`,
     "select tab forkTab",
@@ -2931,8 +2995,12 @@ const openFreshCodexTab = async (repo) => {
     fail("could not find the current Ghostty pane")
   }
   const layoutProvider = paneLayoutProvider(readConfig().paneLayout)
-  const layout = ghosttyTabLayout(sourceLocation.tabId)
-  const placement = layoutProvider.placements(layout)[0]
+  const panePlacement = workspacePanePlacement(
+    repo.topLevel,
+    sourceLocation,
+    layoutProvider,
+  )
+  const { layout, placement } = panePlacement
 
   const surfaceCommand = surfaceCommandForLaunch(repo.topLevel, freshLaunch())
   const workspaceName = path.basename(repo.topLevel)
@@ -2959,8 +3027,13 @@ const openFreshCodexTab = async (repo) => {
       fail("the next new-session placement must target an existing pane")
     }
     return [
+      "set sessionTab to missing value",
+      "repeat with targetTab in tabs of candidateWindow",
+      `if id of targetTab is ${appleScriptQuote(panePlacement.tabId)} then set sessionTab to targetTab`,
+      "end repeat",
+      "if sessionTab is missing value then error \"the planned new-session tab no longer exists\"",
       "set splitTarget to missing value",
-      "repeat with candidateTerminal in terminals of candidateTab",
+      "repeat with candidateTerminal in terminals of sessionTab",
       `if id of candidateTerminal is ${appleScriptQuote(placement.target.terminalId)} then set splitTarget to candidateTerminal`,
       "end repeat",
       'if splitTarget is missing value then error "the planned new-session target no longer exists"',
@@ -2976,7 +3049,6 @@ const openFreshCodexTab = async (repo) => {
     "repeat with candidateTerminal in terminals of candidateTab",
     `if tty of candidateTerminal is ${appleScriptQuote(sourceTty)} then`,
     `set sessionConfig to new surface configuration from {initial working directory:${appleScriptQuote(repo.topLevel)}, command:${appleScriptQuote(surfaceCommand)}}`,
-    "set sessionTab to candidateTab",
     ...placementScript,
     `perform action ${appleScriptQuote("equalize_splits")} on sessionTerminal`,
     "select tab sessionTab",
