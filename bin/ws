@@ -40,8 +40,12 @@ const togglePinMarker = "__WS_TOGGLE_PIN__"
 const directAttentionActionDirectory = path.join(configDirectory, "attention")
 const defaultForkMessage = "This chat was forked from the previous conversation. The original continues independently."
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+let titleDaemonIterationActive = false
 
 const fail = (message) => {
+  if (titleDaemonIterationActive) {
+    throw new Error(message)
+  }
   process.stderr.write(`${commandName}: ${message}\n`)
   process.exit(1)
 }
@@ -1547,21 +1551,32 @@ const runTitleDaemon = async () => {
     }
   })
 
-  for (const runner of listTmuxRunners()) {
-    renderRunnerFooter(runner.name)
-  }
-
   let loadingFrameIndex = 0
   const runnerStates = new Map()
+  let refreshFooters = true
+  titleDaemonIterationActive = true
   while (true) {
-    const result = updateGhosttyTabTitles(
-      runnerStates,
-      loadingFrames[loadingFrameIndex],
-    )
-    loadingFrameIndex = result.working
-      ? (loadingFrameIndex + 1) % loadingFrames.length
-      : 0
-    await waitMilliseconds(result.visibleWorkspace ? 250 : 1_000)
+    try {
+      if (refreshFooters) {
+        for (const runner of listTmuxRunners()) {
+          renderRunnerFooter(runner.name)
+        }
+        refreshFooters = false
+      }
+      const result = updateGhosttyTabTitles(
+        runnerStates,
+        loadingFrames[loadingFrameIndex],
+      )
+      loadingFrameIndex = result.working
+        ? (loadingFrameIndex + 1) % loadingFrames.length
+        : 0
+      await waitMilliseconds(result.visibleWorkspace ? 250 : 1_000)
+    } catch {
+      runnerStates.clear()
+      loadingFrameIndex = 0
+      refreshFooters = true
+      await waitMilliseconds(1_000)
+    }
   }
 }
 
