@@ -118,7 +118,7 @@ Clicking an unread pane marks it read. A thin Braille spinner means Codex is wor
 
 Option+Shift+J reads the focused conversation's own latest finished turn from Codex and renders only its recorded file changes in Delta, so concurrent panes in the same worktree do not get mixed together.
 
-Named conversations show their name in the right-aligned pane footer. Pinned conversations open first, show `📌 pinned` beside the name, and contribute a `📌N` count to the tab title. Names and pins survive reopen, repair, copy, and move.
+Named conversations show their name in the right-aligned pane footer. Pinned conversations open first, use a muted amber footer, show `📌 pinned` beside the name, and contribute a `📌N` count to the tab title. Names and pins survive reopen, repair, copy, and move.
 
 ## Configuration
 

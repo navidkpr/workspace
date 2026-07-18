@@ -1547,6 +1547,10 @@ const runTitleDaemon = async () => {
     }
   })
 
+  for (const runner of listTmuxRunners()) {
+    renderRunnerFooter(runner.name)
+  }
+
   let loadingFrameIndex = 0
   const runnerStates = new Map()
   while (true) {
@@ -1795,7 +1799,13 @@ const renderRunnerFooter = (runnerName) => {
   ].join("")
   runTmux(["set-option", "-t", runnerName, "status", "on"])
   runTmux(["set-option", "-t", runnerName, "status-position", "bottom"])
-  runTmux(["set-option", "-t", runnerName, "status-style", "bg=default,fg=#aeb4be"])
+  runTmux([
+    "set-option",
+    "-t",
+    runnerName,
+    "status-style",
+    pinned ? "bg=#3a3425,fg=#aeb4be" : "bg=default,fg=#aeb4be",
+  ])
   runTmux(["set-option", "-t", runnerName, "status-format[0]", format])
 }
 
