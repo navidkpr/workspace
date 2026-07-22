@@ -23,6 +23,7 @@ test -f "$HOME/.config/ws/ghostty.conf"
 grep -Fq '"paneLayout": "1x3"' "$HOME/.config/ws/config.json"
 grep -Fq '"reviewMode": "delta"' "$HOME/.config/ws/config.json"
 grep -Fq 'keybind = alt+r=set_tab_title:__WS_TOGGLE_ATTENTION__' "$HOME/.config/ws/ghostty.conf"
+grep -Fq 'keybind = alt+u=set_tab_title:__WS_TOGGLE_ATTENTION__' "$HOME/.config/ws/ghostty.conf"
 grep -Fq 'keybind = alt+j=set_tab_title:__WS_REVIEW_WORKSPACE__' "$HOME/.config/ws/ghostty.conf"
 grep -Fq 'keybind = alt+shift+j=set_tab_title:__WS_REVIEW_LAST_TURN__' "$HOME/.config/ws/ghostty.conf"
 ! grep -Fq 'keybind = alt+q=set_tab_title:__WS_REVIEW_WORKSPACE__' "$HOME/.config/ws/ghostty.conf"
@@ -30,6 +31,7 @@ grep -Fq 'keybind = alt+k=set_tab_title:__WS_NAME_SESSION__' "$HOME/.config/ws/g
 grep -Fq 'keybind = alt+f=set_tab_title:__WS_FORK_CURRENT_SESSION__' "$HOME/.config/ws/ghostty.conf"
 grep -Fq 'keybind = alt+p=set_tab_title:__WS_TOGGLE_PIN__' "$HOME/.config/ws/ghostty.conf"
 ! grep -A1 -F 'keybind = alt+r=' "$HOME/.config/ws/ghostty.conf" | tail -1 | grep -Fq 'chain='
+! grep -A1 -F 'keybind = alt+u=' "$HOME/.config/ws/ghostty.conf" | tail -1 | grep -Fq 'chain='
 test "$(grep -Fc '# workspace completion' "$HOME/.zshrc")" -eq 1
 ! grep -Fq '@WS_BIN@' "$HOME/.config/ws/tmux.conf"
 grep -Fq "$HOME/.local/bin/ws" "$HOME/.config/ws/tmux.conf"

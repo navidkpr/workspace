@@ -107,7 +107,7 @@ Use `.` anywhere a workspace name is accepted to target the current checkout.
 | `Option+F` | Fork without interrupting the current conversation; the child composer is prefilled with a handoff. |
 | `Option+N` | Start a fresh Codex conversation using the layout policy. |
 | `Option+W` | Archive the current conversation and close its pane; pinned chats require confirmation. |
-| `Option+R` | Toggle the current conversation between read and unread. |
+| `Option+U` | Toggle the current conversation between read and unread (`Option+R` also works). |
 | `Option+J` | Review the current workspace using the configured review mode. |
 | `Option+Shift+J` | Review only the focused conversation's latest finished turn. |
 | `Option+K` | Name the current conversation. |

@@ -365,7 +365,8 @@ Ghostty shortcuts:
   Option+F      Fork the current Codex session into the configured pane layout.
   Option+N      Open a new Codex session using the configured pane layout.
   Option+W      Force-archive the current Codex session and close its pane.
-  Option+R      Toggle the current persistent pane between read and unread.
+  Option+U      Toggle the current persistent pane between read and unread.
+  Option+R      Alias for Option+U.
   Option+J      Review the current workspace using the configured review mode.
   Option+Shift+J
                 Review only the focused chat's latest finished turn.
